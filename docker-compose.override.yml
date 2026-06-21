@@ -1,0 +1,10 @@
+services:
+  vibe-trading:
+    volumes:
+      - ./vibe-data/runs:/app/agent/runs
+      - ./vibe-data/sessions:/app/agent/sessions
+      - ./vibe-data/home:/home/vibe/.vibe-trading
+      - ./vibe-data/swarm-runs:/app/agent/.swarm/runs
+      - ./vibe-data/uploads:/app/agent/uploads
+
+# 移除命名卷定义，使用本地路径映射

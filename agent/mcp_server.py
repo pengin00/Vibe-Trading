@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,7 @@ logger = logging.getLogger(__name__)
 _skills_loader = None
 _registry = None
 _goal_store = None
+_mcp_session_service = None
 _include_shell_tools = True
 
 
@@ -97,6 +99,113 @@ def _get_goal_store():
 
         _goal_store = GoalStore()
     return _goal_store
+
+
+def _get_mcp_session_service():
+    """Return a lightweight SessionService for MCP-created UI sessions."""
+    global _mcp_session_service
+    if _mcp_session_service is None:
+        from src.session.events import EventBus
+        from src.session.service import SessionService
+        from src.session.store import SessionStore
+
+        _mcp_session_service = SessionService(
+            store=SessionStore(base_dir=AGENT_DIR / "sessions"),
+            event_bus=EventBus(),
+            runs_dir=AGENT_DIR / "runs",
+        )
+    return _mcp_session_service
+
+
+def _safe_ui_session_id(external_session_id: str) -> str:
+    """Map an external MCP session id to a Vibe-Trading path-safe id."""
+    import hashlib
+
+    raw = str(external_session_id or "").strip()
+    if not raw:
+        raise ValueError("session_id is required")
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "-", raw).strip("-")
+    safe = re.sub(r"-{2,}", "-", safe)
+    if not safe:
+        safe = "mcp-session"
+    if safe == raw and len(safe) <= 128:
+        return safe
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+    prefix = safe[:117].strip("-_") or "mcp-session"
+    candidate = f"{prefix}-{digest}"
+    return candidate[:128].strip("-_")
+
+
+def _ensure_ui_session(external_session_id: str, title: str = "", config: dict[str, Any] | None = None):
+    """Create or return a UI-visible session for an external MCP session id."""
+    from datetime import datetime
+
+    from src.session.models import Session
+
+    external = str(external_session_id or "").strip()
+    ui_session_id = _safe_ui_session_id(external)
+    svc = _get_mcp_session_service()
+    session = svc.store.get_session(ui_session_id)
+    session_config = {
+        "source": "mcp",
+        "external_session_id": external,
+        **(config or {}),
+    }
+    if session is None:
+        session = Session(
+            session_id=ui_session_id,
+            title=(title or external or ui_session_id)[:120],
+            config=session_config,
+        )
+        svc.store.create_session(session)
+        svc._search_index.index_session(session.session_id, session.title)
+        svc.event_bus.emit(
+            session.session_id,
+            "session.created",
+            {"session_id": session.session_id, "title": session.title, "source": "mcp"},
+        )
+    else:
+        changed = False
+        if title and not session.title:
+            session.title = title[:120]
+            changed = True
+        merged_config = {**session.config, **session_config}
+        if merged_config != session.config:
+            session.config = merged_config
+            changed = True
+        if changed:
+            session.updated_at = datetime.now().isoformat()
+            svc.store.update_session(session)
+            svc._search_index.index_session(session.session_id, session.title)
+    return session
+
+
+def _append_ui_message(session_id: str, role: str, content: str, metadata: dict[str, Any] | None = None):
+    """Append a UI-visible message without triggering the agent loop."""
+    from datetime import datetime
+
+    from src.session.models import Message
+
+    svc = _get_mcp_session_service()
+    session = svc.store.get_session(session_id)
+    if session is None:
+        raise ValueError(f"Session {session_id} not found")
+    message = Message(
+        session_id=session_id,
+        role=role,
+        content=content,
+        metadata=metadata or {},
+    )
+    svc.store.append_message(message)
+    svc._search_index.index_message(session_id, role, content)
+    session.updated_at = datetime.now().isoformat()
+    svc.store.update_session(session)
+    svc.event_bus.emit(
+        session_id,
+        "message.received",
+        {"message_id": message.message_id, "role": role, "content": content, "source": "mcp"},
+    )
+    return message
 
 
 def _json_ok(**payload: Any) -> str:
@@ -200,6 +309,92 @@ def load_skill(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# UI session bridge tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def ensure_ui_session(
+    session_id: str,
+    title: str = "",
+    topic_key: str | None = None,
+) -> str:
+    """Create or return a Vibe-Trading UI session for an external MCP session.
+
+    External clients such as OpenClaw may use ids that are not safe in REST
+    paths, e.g. ``openclaw:vibe:cn:chip:industry-research``. This tool maps
+    that id to a stable Vibe-Trading session id, creates ``session.json`` under
+    ``agent/sessions/``, and returns both ids. Use the returned
+    ``ui_session_id`` for deep links or REST paths; MCP goal tools accept either
+    the original external id or the returned UI id.
+
+    Args:
+        session_id: External conversation/session id owned by the MCP client.
+        title: Optional title shown in the Vibe-Trading Sessions UI.
+        topic_key: Optional normalized topic key for cross-client bookkeeping.
+    """
+    try:
+        session = _ensure_ui_session(
+            session_id,
+            title=title,
+            config={"topic_key": _blank_to_none(topic_key)} if topic_key else {},
+        )
+        return _json_ok(
+            external_session_id=session_id.strip(),
+            ui_session_id=session.session_id,
+            session=session.to_dict(),
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), error_type="validation")
+
+
+@mcp.tool
+def append_ui_session_message(
+    session_id: str,
+    role: str,
+    content: str,
+    title: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Append a message to a Vibe-Trading UI session without running the agent.
+
+    Use this from MCP clients to mirror user prompts, tool summaries, and final
+    research answers into the Vibe-Trading Sessions UI. It does not call the
+    Vibe-Trading agent loop; it only writes ``messages.jsonl`` and the search
+    index.
+
+    Args:
+        session_id: External MCP id or a Vibe-Trading UI-safe session id.
+        role: Message role: user, assistant, system, or tool.
+        content: Message text to display and index.
+        title: Optional title used when the UI session must be created first.
+        metadata: Optional JSON metadata stored on the message.
+    """
+    try:
+        role = role.strip().lower()
+        if role not in {"user", "assistant", "system", "tool"}:
+            raise ValueError("role must be one of: user, assistant, system, tool")
+        session = _ensure_ui_session(session_id, title=title)
+        message = _append_ui_message(
+            session.session_id,
+            role,
+            content,
+            metadata={
+                "source": "mcp",
+                "external_session_id": session_id.strip(),
+                **(metadata or {}),
+            },
+        )
+        return _json_ok(
+            external_session_id=session_id.strip(),
+            ui_session_id=session.session_id,
+            message=message.to_dict(),
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), error_type="validation")
+
+
+# ---------------------------------------------------------------------------
 # Goal tools
 # ---------------------------------------------------------------------------
 
@@ -234,9 +429,14 @@ def start_research_goal(
         time_budget_seconds: Optional wall-clock budget.
     """
     try:
+        ui_session = _ensure_ui_session(
+            session_id,
+            title=ui_summary or objective[:80],
+            config={"goal_source": "mcp"},
+        )
         clean_criteria = _clean_list(criteria) or _default_goal_criteria()
         goal = _get_goal_store().replace_goal(
-            session_id=session_id.strip(),
+            session_id=ui_session.session_id,
             objective=objective,
             criteria=clean_criteria,
             ui_summary=ui_summary,
@@ -248,7 +448,22 @@ def start_research_goal(
             time_budget_seconds=time_budget_seconds,
         )
         snapshot = _get_goal_store().get_goal_snapshot(goal.goal_id)
-        return _json_ok(snapshot=snapshot)
+        _append_ui_message(
+            ui_session.session_id,
+            "system",
+            f"MCP research goal started: {objective}",
+            metadata={
+                "source": "mcp",
+                "event": "goal.started",
+                "external_session_id": session_id.strip(),
+                "goal_id": goal.goal_id,
+            },
+        )
+        return _json_ok(
+            external_session_id=session_id.strip(),
+            ui_session_id=ui_session.session_id,
+            snapshot=snapshot,
+        )
     except ValueError as exc:
         return _json_error(str(exc), error_type="validation")
 
@@ -261,12 +476,17 @@ def get_research_goal(session_id: str) -> str:
         session_id: External conversation/session id owned by the MCP client.
     """
     try:
-        snapshot = _get_goal_store().get_current_snapshot(session_id.strip())
+        ui_session = _ensure_ui_session(session_id)
+        snapshot = _get_goal_store().get_current_snapshot(ui_session.session_id)
     except ValueError as exc:
         return _json_error(str(exc), error_type="validation")
     if snapshot is None:
         return _json_error("No current goal", error_type="not_found")
-    return _json_ok(snapshot=snapshot)
+    return _json_ok(
+        external_session_id=session_id.strip(),
+        ui_session_id=ui_session.session_id,
+        snapshot=snapshot,
+    )
 
 
 @mcp.tool
@@ -325,8 +545,9 @@ def add_goal_evidence(
     try:
         from src.goal import EvidenceInput, StaleGoalError
 
+        ui_session = _ensure_ui_session(session_id)
         evidence = _get_goal_store().append_evidence(
-            session_id=session_id.strip(),
+            session_id=ui_session.session_id,
             goal_id=goal_id.strip(),
             expected_goal_id=expected_goal_id.strip(),
             evidence=EvidenceInput(
@@ -357,7 +578,24 @@ def add_goal_evidence(
             return _json_error("Goal snapshot could not be reloaded")
         from dataclasses import asdict
 
-        return _json_ok(evidence=asdict(evidence), snapshot=snapshot)
+        _append_ui_message(
+            ui_session.session_id,
+            "tool",
+            f"Evidence added: {text}",
+            metadata={
+                "source": "mcp",
+                "event": "goal.evidence",
+                "external_session_id": session_id.strip(),
+                "goal_id": goal_id.strip(),
+                "evidence_id": evidence.evidence_id,
+            },
+        )
+        return _json_ok(
+            external_session_id=session_id.strip(),
+            ui_session_id=ui_session.session_id,
+            evidence=asdict(evidence),
+            snapshot=snapshot,
+        )
     except StaleGoalError as exc:
         return _json_error(str(exc), error_type="stale_goal")
     except ValueError as exc:
@@ -390,8 +628,9 @@ def update_research_goal_status(
     try:
         from src.goal import GoalStatus, StaleGoalError
 
+        ui_session = _ensure_ui_session(session_id)
         updated = _get_goal_store().update_status(
-            session_id=session_id.strip(),
+            session_id=ui_session.session_id,
             goal_id=goal_id.strip(),
             expected_goal_id=expected_goal_id.strip(),
             status=GoalStatus(status),
@@ -401,7 +640,24 @@ def update_research_goal_status(
         snapshot = _get_goal_store().get_goal_snapshot(updated.goal_id)
         if snapshot is None:
             return _json_error("Goal snapshot could not be reloaded")
-        return _json_ok(goal=snapshot["goal"], snapshot=snapshot)
+        _append_ui_message(
+            ui_session.session_id,
+            "system",
+            f"MCP research goal status updated to {status}: {recap or ''}".strip(),
+            metadata={
+                "source": "mcp",
+                "event": "goal.status",
+                "external_session_id": session_id.strip(),
+                "goal_id": goal_id.strip(),
+                "status": status,
+            },
+        )
+        return _json_ok(
+            external_session_id=session_id.strip(),
+            ui_session_id=ui_session.session_id,
+            goal=snapshot["goal"],
+            snapshot=snapshot,
+        )
     except StaleGoalError as exc:
         return _json_error(str(exc), error_type="stale_goal")
     except ValueError as exc:
@@ -1453,13 +1709,14 @@ def main():
     parser = argparse.ArgumentParser(description="Vibe-Trading MCP Server")
     parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio", help="MCP transport (default: stdio)")
     parser.add_argument("--port", type=int, default=8900, help="SSE port (only used with --transport sse)")
+    parser.add_argument("--host", default="0.0.0.0", help="SSE host (only used with --transport sse)")
     args = parser.parse_args()
     _include_shell_tools = True if args.transport == "stdio" else _env_shell_tools_enabled()
     _registry = None
     _get_registry()  # pre-warm: avoids deadlock when first tools/call lazy-inits inside FastMCP worker thread
 
     if args.transport == "sse":
-        mcp.run(transport="sse", port=args.port)
+        mcp.run(transport="sse", host=args.host, port=args.port)
     else:
         mcp.run()
 
