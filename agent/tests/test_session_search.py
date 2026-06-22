@@ -29,8 +29,24 @@ class TestIndexing:
         index.index_session("s1", "My first session")
         # No crash, session stored
         results = index.search("first session")
-        # May or may not match depending on FTS5 availability
-        # At minimum: no crash
+        assert any(m.session_id == "s1" for m in results)
+
+    def test_index_session_title_without_messages(self, index: SessionSearchIndex) -> None:
+        index.index_session("s1", "中信组合体检+调仓方案")
+        results = index.search("组合体检")
+        assert any(m.session_id == "s1" for m in results)
+
+    def test_cjk_message_substring_with_trigram(self, index: SessionSearchIndex) -> None:
+        index.index_session("s1", "中信研究")
+        index.index_message("s1", "user", "中信证券账户主动管理组合体检与调仓方案")
+        results = index.search("组合体检")
+        assert any(m.session_id == "s1" for m in results)
+
+    def test_short_cjk_message_substring_falls_back_to_like(self, index: SessionSearchIndex) -> None:
+        index.index_session("s1", "券商研究")
+        index.index_message("s1", "user", "中信证券账户主动管理组合体检与调仓方案")
+        results = index.search("中信")
+        assert any(m.session_id == "s1" for m in results)
 
     def test_index_message(self, index: SessionSearchIndex) -> None:
         index.index_session("s1", "Test session")
@@ -175,8 +191,45 @@ class TestSanitizeFtsQuery:
 
     def test_cjk(self) -> None:
         result = SessionSearchIndex._sanitize_fts_query("比特币价格")
-        assert "比" in result
-        assert "币" in result
+        assert '"比特币价格"' in result
+
+    def test_short_cjk_uses_like_fallback_only(self) -> None:
+        result = SessionSearchIndex._sanitize_fts_query("中信")
+        assert result == '""'
+
+
+class TestFtsMigration:
+    def test_existing_unicode61_index_is_recreated_as_trigram(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "legacy.db"
+        import sqlite3
+
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                started_at REAL NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tool_name TEXT,
+                timestamp REAL NOT NULL
+            );
+            CREATE VIRTUAL TABLE messages_fts
+            USING fts5(content, content=messages, content_rowid=id);
+        """)
+        conn.close()
+
+        index = SessionSearchIndex(db_path=db_path)
+        row = index._get_conn().execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'"
+        ).fetchone()
+        assert row is not None
+        assert "trigram" in row[0]
 
 
 # ---------------------------------------------------------------------------

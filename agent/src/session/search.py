@@ -105,13 +105,20 @@ class SessionSearchIndex:
             CREATE INDEX IF NOT EXISTS idx_messages_session
                 ON messages(session_id);
         """)
+        if not self._fts_uses_trigram(conn):
+            conn.executescript("""
+                DROP TRIGGER IF EXISTS messages_ai;
+                DROP TRIGGER IF EXISTS messages_ad;
+                DROP TABLE IF EXISTS messages_fts;
+            """)
         # FTS5 virtual table — create separately (not inside executescript with IF NOT EXISTS
         # because FTS5 syntax varies across SQLite versions)
         try:
             conn.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
-                USING fts5(content, content=messages, content_rowid=id)
+                USING fts5(content, content=messages, content_rowid=id, tokenize='trigram')
             """)
+            conn.execute("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")
         except sqlite3.OperationalError:
             pass  # already exists or FTS5 not available
 
@@ -130,6 +137,16 @@ class SessionSearchIndex:
             except sqlite3.OperationalError:
                 pass
         conn.commit()
+
+    @staticmethod
+    def _fts_uses_trigram(conn: sqlite3.Connection) -> bool:
+        """Return whether the current FTS table was created with trigram."""
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'"
+        ).fetchone()
+        if not row or not row[0]:
+            return True
+        return "tokenize='trigram'" in row[0] or 'tokenize="trigram"' in row[0] or "tokenize=trigram" in row[0]
 
     def index_session(
         self,
@@ -162,6 +179,16 @@ class SessionSearchIndex:
             ")",
             (session_id, title, ts, session_id, time.time(), session_id),
         )
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ? AND role = ?",
+            (session_id, "session_title"),
+        )
+        if title and title.strip():
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, tool_name, timestamp) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, "session_title", title.strip()[:50_000], None, time.time()),
+            )
         conn.commit()
 
     def index_message(self, session_id: str, role: str, content: str,
@@ -192,7 +219,9 @@ class SessionSearchIndex:
     def _sanitize_fts_query(query: str) -> str:
         """Sanitize a user query for FTS5 MATCH syntax.
 
-        - Splits on non-alphanumeric/CJK to extract tokens
+        - Keeps CJK runs together so the trigram tokenizer can do substring
+          matching for 3+ character terms
+        - Splits ASCII-ish terms on punctuation
         - Joins with OR so any-word-matches (not all-words-required)
         - Quotes each token to prevent FTS5 operator interpretation
 
@@ -203,12 +232,62 @@ class SessionSearchIndex:
             FTS5-safe MATCH expression.
         """
         import re as _re
-        # Extract alphanumeric tokens (3+ chars) and CJK characters
-        tokens = _re.findall(r"[a-zA-Z0-9_]{2,}|[\u4e00-\u9fff\u3400-\u4dbf]", query)
+        tokens = _re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf]{3,}|[a-zA-Z0-9_]{2,}", query)
         if not tokens:
             return '""'
         # Quote each token and join with OR for broader matching
         return " OR ".join(f'"{t}"' for t in tokens)
+
+    def _append_like_matches(
+        self,
+        seen: dict[str, SearchMatch],
+        query: str,
+        max_sessions: int,
+    ) -> None:
+        """Append title/message substring matches for short CJK and FTS gaps."""
+        if len(seen) >= max_sessions:
+            return
+        query = query.strip()
+        if not query:
+            return
+        conn = self._get_conn()
+        like_query = f"%{query}%"
+        cursor = conn.execute(
+            """
+            SELECT
+                s.id,
+                s.title,
+                s.started_at,
+                s.message_count,
+                CASE
+                    WHEN s.title LIKE ? THEN s.title
+                    ELSE COALESCE(m.content, s.title, '')
+                END AS snippet
+            FROM sessions s
+            LEFT JOIN messages m
+                ON m.session_id = s.id
+                AND m.content LIKE ?
+            WHERE s.title LIKE ? OR m.id IS NOT NULL
+            GROUP BY s.id
+            ORDER BY s.started_at DESC
+            LIMIT ?
+            """,
+            (like_query, like_query, like_query, max_sessions),
+        )
+        for row in cursor.fetchall():
+            sid = row[0]
+            if sid in seen:
+                continue
+            seen[sid] = SearchMatch(
+                session_id=row[0],
+                title=row[1] or "(untitled)",
+                started_at=self._format_time(row[2]),
+                message_count=row[3],
+                snippet=row[4] or "",
+                rank=0.0,
+            )
+            if len(seen) >= max_sessions:
+                break
 
     def search(self, query: str, max_sessions: int = 3) -> List[SearchMatch]:
         """Full-text search across all sessions.
@@ -222,44 +301,46 @@ class SessionSearchIndex:
         """
         conn = self._get_conn()
         fts_query = self._sanitize_fts_query(query)
-        try:
-            cursor = conn.execute(
-                """
-                SELECT
-                    m.session_id,
-                    s.title,
-                    s.started_at,
-                    s.message_count,
-                    snippet(messages_fts, 0, '>>>', '<<<', '...', 64) AS snippet,
-                    rank
-                FROM messages_fts
-                JOIN messages m ON m.id = messages_fts.rowid
-                JOIN sessions s ON s.id = m.session_id
-                WHERE messages_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (fts_query, max_sessions * 5),
-            )
-        except sqlite3.OperationalError as exc:
-            logger.warning("FTS5 search failed: %s", exc)
-            return []
-
         seen: dict[str, SearchMatch] = {}
-        for row in cursor.fetchall():
-            sid = row[0]
-            if sid in seen:
-                continue
-            seen[sid] = SearchMatch(
-                session_id=row[0],
-                title=row[1] or "(untitled)",
-                started_at=self._format_time(row[2]),
-                message_count=row[3],
-                snippet=row[4],
-                rank=row[5],
-            )
-            if len(seen) >= max_sessions:
-                break
+        if fts_query != '""':
+            try:
+                cursor = conn.execute(
+                    """
+                    SELECT
+                        m.session_id,
+                        s.title,
+                        s.started_at,
+                        s.message_count,
+                        snippet(messages_fts, 0, '>>>', '<<<', '...', 64) AS snippet,
+                        rank
+                    FROM messages_fts
+                    JOIN messages m ON m.id = messages_fts.rowid
+                    JOIN sessions s ON s.id = m.session_id
+                    WHERE messages_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (fts_query, max_sessions * 5),
+                )
+            except sqlite3.OperationalError as exc:
+                logger.warning("FTS5 search failed: %s", exc)
+            else:
+                for row in cursor.fetchall():
+                    sid = row[0]
+                    if sid in seen:
+                        continue
+                    seen[sid] = SearchMatch(
+                        session_id=row[0],
+                        title=row[1] or "(untitled)",
+                        started_at=self._format_time(row[2]),
+                        message_count=row[3],
+                        snippet=row[4],
+                        rank=row[5],
+                    )
+                    if len(seen) >= max_sessions:
+                        break
+
+        self._append_like_matches(seen, query, max_sessions)
 
         return list(seen.values())
 
@@ -315,7 +396,7 @@ class SessionSearchIndex:
                             msg = json.loads(line)
                             role = msg.get("role", "")
                             content = msg.get("content", "")
-                            if content and role in ("user", "assistant"):
+                            if content and role:
                                 self.index_message(sid, role, content)
                                 count += 1
                         except json.JSONDecodeError:

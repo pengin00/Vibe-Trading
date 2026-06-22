@@ -35,6 +35,7 @@ import logging
 import os
 import re
 import sys
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -136,6 +137,79 @@ def _safe_ui_session_id(external_session_id: str) -> str:
     return candidate[:128].strip("-_")
 
 
+def _generate_session_title(objective: str, ui_summary: str = "") -> str:
+    """Generate a compact UI title from an MCP research objective."""
+    text = (ui_summary or objective or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(
+        r"^(请|帮我|麻烦|继续|接着|再)?\s*(分析|研究|看一下|看看|做一下|梳理|评估)\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    text = re.sub(r"^(关于|一下|下)\s*", "", text).strip()
+    if not text:
+        return "MCP Research"
+    if len(text) <= 28:
+        return text
+    separators = ["，", ",", "。", ".", "；", ";", "：", ":", " - ", " -- "]
+    cut = len(text)
+    for sep in separators:
+        pos = text.find(sep)
+        if 8 <= pos <= 36:
+            cut = min(cut, pos)
+    if cut != len(text):
+        text = text[:cut].strip()
+    if len(text) > 36:
+        text = text[:34].rstrip() + "..."
+    return text or "MCP Research"
+
+
+def _session_matches_external_id(session: Any, external_session_id: str) -> bool:
+    """Return whether a UI session is already associated with an external id."""
+    external = str(external_session_id or "").strip()
+    config = getattr(session, "config", {}) or {}
+    aliases = config.get("external_session_aliases") or []
+    return (
+        session.session_id == external
+        or session.session_id == _safe_ui_session_id(external)
+        or config.get("external_session_id") == external
+        or external in aliases
+    )
+
+
+def _find_session_by_external_id(external_session_id: str):
+    """Find an existing UI session by exact id, mapped id, or MCP alias."""
+    svc = _get_mcp_session_service()
+    external = str(external_session_id or "").strip()
+    for candidate in (external, _safe_ui_session_id(external)):
+        session = svc.store.get_session(candidate)
+        if session is not None:
+            return session
+    for session in svc.list_sessions(limit=500):
+        if _session_matches_external_id(session, external):
+            return session
+    return None
+
+
+def _attach_external_session_alias(session: Any, external_session_id: str) -> None:
+    """Persist an external MCP id as an alias for a reused UI session."""
+    from datetime import datetime
+
+    external = str(external_session_id or "").strip()
+    if not external:
+        return
+    config = dict(session.config or {})
+    aliases = list(config.get("external_session_aliases") or [])
+    if external != config.get("external_session_id") and external not in aliases:
+        aliases.append(external)
+        config["external_session_aliases"] = aliases[-20:]
+        config.setdefault("source", "mcp")
+        session.config = config
+        session.updated_at = datetime.now().isoformat()
+        _get_mcp_session_service().store.update_session(session)
+
+
 def _ensure_ui_session(external_session_id: str, title: str = "", config: dict[str, Any] | None = None):
     """Create or return a UI-visible session for an external MCP session id."""
     from datetime import datetime
@@ -145,7 +219,7 @@ def _ensure_ui_session(external_session_id: str, title: str = "", config: dict[s
     external = str(external_session_id or "").strip()
     ui_session_id = _safe_ui_session_id(external)
     svc = _get_mcp_session_service()
-    session = svc.store.get_session(ui_session_id)
+    session = _find_session_by_external_id(external)
     session_config = {
         "source": "mcp",
         "external_session_id": external,
@@ -166,10 +240,15 @@ def _ensure_ui_session(external_session_id: str, title: str = "", config: dict[s
         )
     else:
         changed = False
-        if title and not session.title:
+        if title and (not session.title or session.title in {external, ui_session_id, "MCP Research"}):
             session.title = title[:120]
             changed = True
+        aliases = list((session.config or {}).get("external_session_aliases") or [])
+        if external != (session.config or {}).get("external_session_id") and external not in aliases:
+            aliases.append(external)
         merged_config = {**session.config, **session_config}
+        if aliases:
+            merged_config["external_session_aliases"] = aliases[-20:]
         if merged_config != session.config:
             session.config = merged_config
             changed = True
@@ -206,6 +285,25 @@ def _append_ui_message(session_id: str, role: str, content: str, metadata: dict[
         {"message_id": message.message_id, "role": role, "content": content, "source": "mcp"},
     )
     return message
+
+
+def _session_similarity(session: Any, objective: str, ui_summary: str = "") -> float:
+    """Score how likely a session is related to a new objective."""
+    haystack = " ".join(
+        [
+            getattr(session, "title", "") or "",
+            str((getattr(session, "config", {}) or {}).get("topic_key") or ""),
+        ]
+    ).lower()
+    needle = " ".join([objective or "", ui_summary or ""]).lower().strip()
+    if not haystack or not needle:
+        return 0.0
+    ratio = SequenceMatcher(None, haystack, needle).ratio()
+    tokens = set(re.findall(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]", needle, re.IGNORECASE))
+    if not tokens:
+        return ratio
+    overlap = sum(1 for token in tokens if token in haystack) / len(tokens)
+    return max(ratio, overlap)
 
 
 def _json_ok(**payload: Any) -> str:
@@ -394,6 +492,160 @@ def append_ui_session_message(
         return _json_error(str(exc), error_type="validation")
 
 
+@mcp.tool
+def list_ui_sessions(limit: int = 20, source: str = "") -> str:
+    """List Vibe-Trading UI sessions visible in the Sessions page.
+
+    This is a read-only MCP helper for clients such as OpenClaw to discover
+    reusable Vibe-Trading sessions before starting a new research goal.
+
+    Args:
+        limit: Maximum sessions to return. Defaults to 20, capped at 100.
+        source: Optional source filter, e.g. ``mcp``.
+    """
+    try:
+        limit = max(1, min(int(limit), 100))
+        source_filter = source.strip().lower()
+        sessions = []
+        for session in _get_mcp_session_service().list_sessions(limit=500):
+            config = session.config or {}
+            if source_filter and str(config.get("source") or "").lower() != source_filter:
+                continue
+            sessions.append(session.to_dict())
+            if len(sessions) >= limit:
+                break
+        return _json_ok(count=len(sessions), sessions=sessions)
+    except ValueError as exc:
+        return _json_error(str(exc), error_type="validation")
+
+
+@mcp.tool
+def search_ui_sessions(query: str, max_results: int = 5) -> str:
+    """Search Vibe-Trading UI sessions using the local FTS5 session index.
+
+    Args:
+        query: Search keywords or natural-language topic.
+        max_results: Maximum matching sessions to return. Defaults to 5,
+            capped at 100.
+    """
+    try:
+        query = query.strip()
+        if not query:
+            raise ValueError("query is required")
+        max_results = max(1, min(int(max_results), 100))
+        from src.session.search import get_shared_index
+
+        matches = [match.to_dict() for match in get_shared_index().search(query, max_sessions=max_results)]
+        return _json_ok(query=query, count=len(matches), sessions=matches)
+    except ValueError as exc:
+        return _json_error(str(exc), error_type="validation")
+
+
+@mcp.tool
+def find_or_create_session(
+    external_session_id: str,
+    objective: str,
+    ui_summary: str = "",
+    similarity_threshold: float = 0.55,
+    max_candidates: int = 3,
+) -> str:
+    """Find a related Vibe-Trading UI session or create a new one.
+
+    Use this before starting a research goal when a client wants one topic to
+    reuse the same Vibe-Trading Session across multiple OpenClaw turns.
+    Matching is conservative: exact external-id aliases win first, then FTS5
+    search/title similarity candidates are considered. When an existing UI
+    session is reused, the new external id is stored as an alias so later MCP
+    calls with that external id resolve to the reused session.
+
+    Args:
+        external_session_id: External MCP client conversation/session id.
+        objective: New research objective or user prompt.
+        ui_summary: Optional compact UI summary.
+        similarity_threshold: Reuse threshold from 0.0 to 1.0. Defaults to 0.55.
+        max_candidates: Number of search/list candidates to inspect. Defaults
+            to 3, capped at 10.
+    """
+    try:
+        external = external_session_id.strip()
+        objective = objective.strip()
+        if not external:
+            raise ValueError("external_session_id is required")
+        if not objective:
+            raise ValueError("objective is required")
+        similarity_threshold = max(0.0, min(float(similarity_threshold), 1.0))
+        max_candidates = max(1, min(int(max_candidates), 10))
+
+        existing = _find_session_by_external_id(external)
+        if existing is not None:
+            return _json_ok(
+                action="reused",
+                reason="external_id_match",
+                external_session_id=external,
+                ui_session_id=existing.session_id,
+                title=existing.title,
+                matched_session=existing.to_dict(),
+                similarity_score=1.0,
+            )
+
+        svc = _get_mcp_session_service()
+        candidates: dict[str, Any] = {}
+        from src.session.search import get_shared_index
+
+        for match in get_shared_index().search(" ".join([objective, ui_summary]).strip(), max_sessions=max_candidates):
+            session = svc.store.get_session(match.session_id)
+            if session is not None:
+                candidates[session.session_id] = session
+        for session in svc.list_sessions(limit=max_candidates):
+            candidates.setdefault(session.session_id, session)
+
+        scored = sorted(
+            (
+                (_session_similarity(session, objective, ui_summary), session)
+                for session in candidates.values()
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        if scored:
+            top_score, top_session = scored[0]
+            if top_score >= similarity_threshold:
+                _attach_external_session_alias(top_session, external)
+                return _json_ok(
+                    action="reused",
+                    reason="similarity_match",
+                    external_session_id=external,
+                    ui_session_id=top_session.session_id,
+                    title=top_session.title,
+                    matched_session=top_session.to_dict(),
+                    similarity_score=round(top_score, 4),
+                    candidates=[
+                        {"session_id": s.session_id, "title": s.title, "similarity_score": round(score, 4)}
+                        for score, s in scored[:max_candidates]
+                    ],
+                )
+
+        title = _generate_session_title(objective, ui_summary)
+        session = _ensure_ui_session(
+            external,
+            title=title,
+            config={"topic_key": _blank_to_none(ui_summary), "goal_source": "mcp"},
+        )
+        return _json_ok(
+            action="created",
+            external_session_id=external,
+            ui_session_id=session.session_id,
+            title=session.title,
+            session=session.to_dict(),
+            candidates=[
+                {"session_id": s.session_id, "title": s.title, "similarity_score": round(score, 4)}
+                for score, s in scored[:max_candidates]
+            ],
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), error_type="validation")
+
+
 # ---------------------------------------------------------------------------
 # Goal tools
 # ---------------------------------------------------------------------------
@@ -431,7 +683,7 @@ def start_research_goal(
     try:
         ui_session = _ensure_ui_session(
             session_id,
-            title=ui_summary or objective[:80],
+            title=_generate_session_title(objective, ui_summary),
             config={"goal_source": "mcp"},
         )
         clean_criteria = _clean_list(criteria) or _default_goal_criteria()
