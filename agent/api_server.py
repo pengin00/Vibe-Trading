@@ -66,6 +66,27 @@ class Artifact(BaseModel):
     exists: bool = Field(..., description="Whether the file exists")
 
 
+class SessionTraceEntry(BaseModel):
+    """One session trace entry for UI inspection."""
+    type: str
+    ts: Optional[float] = None
+    iter: Optional[int] = None
+    tool: Optional[str] = None
+    call_id: Optional[str] = None
+    status: Optional[str] = None
+    elapsed_ms: Optional[int] = None
+    args: Optional[Dict[str, Any]] = None
+    result: Optional[str] = None
+    preview: Optional[str] = None
+    skill_name: Optional[str] = None
+
+
+class SessionTraceResponse(BaseModel):
+    """Session trace payload."""
+    session_id: str
+    entries: List[SessionTraceEntry]
+
+
 class BacktestMetrics(BaseModel):
     """Backtest summary metrics."""
     model_config = {"extra": "allow"}
@@ -2193,6 +2214,70 @@ async def session_events(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.get(
+    "/sessions/{session_id}/trace",
+    response_model=SessionTraceResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def get_session_trace(session_id: str):
+    """Return full tool/skill trace records for a session."""
+    _validate_path_param(session_id, "session_id")
+    trace_dir = SESSIONS_DIR / session_id
+    if not trace_dir.exists():
+        return SessionTraceResponse(session_id=session_id, entries=[])
+
+    from src.agent.trace import TraceWriter
+
+    raw_entries = TraceWriter.read(
+        trace_dir,
+        resolve_offloads=True,
+        resolve_fields={"result"},
+    )
+    entries: list[SessionTraceEntry] = []
+    tool_call_args: dict[str, dict[str, Any]] = {}
+    for raw in raw_entries:
+        entry_type = str(raw.get("type") or "")
+        if entry_type == "tool_call":
+            args = raw.get("args") if isinstance(raw.get("args"), dict) else {}
+            call_id = str(raw.get("call_id") or "")
+            if call_id:
+                tool_call_args[call_id] = args
+            skill_name = None
+            if raw.get("tool") == "load_skill":
+                value = args.get("skill_name") or args.get("name")
+                skill_name = str(value) if value else None
+            entries.append(SessionTraceEntry(
+                type="skill_call" if raw.get("tool") == "load_skill" else "tool_call",
+                ts=raw.get("ts"),
+                iter=raw.get("iter"),
+                tool=raw.get("tool"),
+                call_id=call_id or None,
+                args=args,
+                skill_name=skill_name,
+            ))
+        elif entry_type == "tool_result":
+            call_id = str(raw.get("call_id") or "")
+            args = tool_call_args.get(call_id)
+            skill_name = None
+            if raw.get("tool") == "load_skill" and args:
+                value = args.get("skill_name") or args.get("name")
+                skill_name = str(value) if value else None
+            entries.append(SessionTraceEntry(
+                type="skill_result" if raw.get("tool") == "load_skill" else "tool_result",
+                ts=raw.get("ts"),
+                iter=raw.get("iter"),
+                tool=raw.get("tool"),
+                call_id=call_id or None,
+                status=raw.get("status"),
+                elapsed_ms=raw.get("elapsed_ms"),
+                args=args,
+                result=raw.get("result"),
+                preview=raw.get("preview") or raw.get("result_preview"),
+                skill_name=skill_name,
+            ))
+    return SessionTraceResponse(session_id=session_id, entries=entries)
 
 
 # ============================================================================

@@ -81,7 +81,11 @@ class ReadFileTool(BaseTool):
             return json.dumps(
                 {
                     "status": "error",
-                    "error": f"File not found or path escapes workspace: {file_path}",
+                    "error": (
+                        f"File not found or path escapes workspace: {file_path}. "
+                        "Only read files that were created or returned by a previous tool in this run; "
+                        "do not guess artifact filenames."
+                    ),
                 },
                 ensure_ascii=False,
             )

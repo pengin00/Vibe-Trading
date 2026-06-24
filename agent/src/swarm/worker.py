@@ -16,6 +16,12 @@ from typing import Any, Callable
 
 from src.agent.context import ContextBuilder
 from src.agent.progress import HeartbeatTimer
+from src.agent.research_guard import (
+    GROUNDING_PROMPT,
+    GROUNDING_RETRY_PROMPT,
+    is_grounding_tool,
+    resolve_grounding_policy,
+)
 from src.agent.skills import SkillsLoader
 from src.agent.tools import ToolRegistry
 from src.config.schema import AgentConfig
@@ -370,6 +376,13 @@ def run_worker(
             input_tokens=0, output_tokens=0,
         )
 
+    grounding_policy = resolve_grounding_policy(
+        f"{agent_spec.role}\n\n{agent_spec.system_prompt}\n\n{user_prompt}",
+        force_data_agent=_is_data_agent(agent_spec),
+    )
+    if grounding_policy.required:
+        system_prompt = f"{system_prompt}\n\n{GROUNDING_PROMPT}"
+
     # 5. Build initial messages
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
@@ -548,6 +561,43 @@ def run_worker(
 
         # If no tool calls, this is the final response
         if not response.has_tool_calls:
+            if grounding_policy.required and data_tool_calls == 0:
+                if not is_last_iteration:
+                    _emit(
+                        event_callback,
+                        "worker_grounding_required",
+                        agent_id,
+                        task_id,
+                        {
+                            "iteration": iteration,
+                            "reason": grounding_policy.reason,
+                            "message": "Tool/data grounding is required before final answer.",
+                        },
+                    )
+                    messages.append({"role": "assistant", "content": response.content or ""})
+                    messages.append({"role": "user", "content": GROUNDING_RETRY_PROMPT})
+                    continue
+                reason = "research grounding required but no data/tool call was completed"
+                summary = response.content or last_assistant_content or reason
+                summary = _resolve_summary(artifact_dir, summary)
+                _write_summary(artifact_dir, summary)
+                _persist_messages(artifact_dir, messages)
+                _emit(
+                    event_callback,
+                    "worker_incomplete",
+                    agent_id,
+                    task_id,
+                    {"iterations": iteration + 1, "reason": reason},
+                )
+                return WorkerResult(
+                    status="incomplete",
+                    summary=summary,
+                    artifact_paths=_collect_artifacts(artifact_dir),
+                    iterations=iteration + 1,
+                    error=reason,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                )
             summary = response.content or last_assistant_content or "(no summary)"
             summary = _resolve_summary(artifact_dir, summary)
             _write_summary(artifact_dir, summary)
@@ -619,7 +669,7 @@ def run_worker(
                 emit=_on_heartbeat,
             ):
                 result = registry.execute(tc.name, args)
-            if tc.name != "load_skill" and not _is_error_result(result):
+            if is_grounding_tool(tc.name, available_tools=agent_spec.tools or []) and not _is_error_result(result):
                 data_tool_calls += 1
             tc_elapsed = time.monotonic() - tc_start
             _emit(

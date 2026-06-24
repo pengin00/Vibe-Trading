@@ -27,6 +27,12 @@ from typing import Any, Callable, Dict, List, Optional
 from src.agent.context import ContextBuilder
 from src.agent.memory import WorkspaceMemory
 from src.agent.progress import HeartbeatTimer, ProgressEvent, _set_emitter
+from src.agent.research_guard import (
+    GROUNDING_FAILURE_MESSAGE,
+    GROUNDING_RETRY_PROMPT,
+    is_grounding_tool,
+    resolve_grounding_policy,
+)
 from src.agent.tools import ToolRegistry
 from src.agent.trace import TraceWriter
 from src.core.state import RunStateStore
@@ -455,6 +461,7 @@ class AgentLoop:
         self._called_ok: set[str] = set()
         self._cancel_event = threading.Event()
         self._previous_summary: str = ""
+        self._grounding_tool_calls: int = 0
         self._persistent_memory = persistent_memory
         self._run_iteration: int = 0
 
@@ -482,6 +489,7 @@ class AgentLoop:
         self._cancel_event.clear()
         self._called_ok = set()
         self._previous_summary = ""
+        self._grounding_tool_calls = 0
 
         state_store = RunStateStore()
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -505,6 +513,7 @@ class AgentLoop:
             )
         goal_store = None
         goal_turn_accounted = False
+        grounding_policy = resolve_grounding_policy(llm_user_message)
         messages = context.build_messages(llm_user_message, history)
         react_trace: List[Dict[str, Any]] = []
 
@@ -528,6 +537,14 @@ class AgentLoop:
             value=user_message,
             offload_kind=f"user-message-{self._run_iteration + 1}",
         )
+        if grounding_policy.required:
+            trace.write(
+                {
+                    "type": "research_grounding_required",
+                    "mode": grounding_policy.mode,
+                    "reason": grounding_policy.reason,
+                }
+            )
 
         iteration = 0
         final_content = ""
@@ -734,6 +751,38 @@ class AgentLoop:
                             }
                         )
                         break
+                    if grounding_policy.required and self._grounding_tool_calls == 0:
+                        if not is_last_iteration:
+                            trace.write(
+                                {
+                                    "type": "final_answer_blocked_no_grounding",
+                                    "iter": current_iter,
+                                    "mode": grounding_policy.mode,
+                                    "reason": grounding_policy.reason,
+                                }
+                            )
+                            self._emit(
+                                "grounding_required",
+                                {
+                                    "iter": current_iter,
+                                    "reason": grounding_policy.reason,
+                                    "message": "Tool/data grounding is required before final answer.",
+                                },
+                            )
+                            messages.append({"role": "assistant", "content": final_content})
+                            messages.append({"role": "user", "content": GROUNDING_RETRY_PROMPT})
+                            continue
+                        final_content = GROUNDING_FAILURE_MESSAGE
+                        trace.write(
+                            {
+                                "type": "final_answer_rejected_no_grounding",
+                                "iter": current_iter,
+                                "mode": grounding_policy.mode,
+                                "reason": grounding_policy.reason,
+                            }
+                        )
+                        state_store.mark_failure(run_dir, final_content)
+                        break
                     should_continue_goal = False
                     continuation_snapshot = None
                     if active_goal_id and session_id and GOAL_MAX_CONTINUATIONS > 0:
@@ -866,6 +915,9 @@ class AgentLoop:
             final_reason = "cancelled by user"
             state_store.mark_failure(run_dir, final_reason)
             final_status = "cancelled"
+        elif final_content == GROUNDING_FAILURE_MESSAGE:
+            final_reason = final_content
+            final_status = "failed"
         elif (run_dir / "artifacts" / "metrics.csv").exists() or final_content:
             state_store.mark_success(run_dir)
             final_status = "success"
@@ -1297,6 +1349,10 @@ class AgentLoop:
         success = _is_tool_success(result)
         if success:
             self._called_ok.add(tc.name)
+            if is_grounding_tool(tc.name):
+                self._grounding_tool_calls += 1
+                trace.write({"type": "grounding_tool_call", "iter": iteration, "tool": tc.name})
+                self._emit("grounding_tool_call", {"tool": tc.name, "iter": iteration})
 
         status = "ok" if success else "error"
         truncated = result[:TOOL_RESULT_LIMIT]

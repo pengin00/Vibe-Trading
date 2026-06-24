@@ -1,11 +1,11 @@
 import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState, useMemo, useCallback, type FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Send, Loader2, ArrowDown, Square, Download, Plus, Paperclip, X, Users, Target, ChevronDown, Pencil, Check, Play, OctagonX, Activity, Ban, CheckCircle2, Landmark } from "lucide-react";
+import { Send, Loader2, ArrowDown, Square, Download, Plus, Paperclip, X, Users, Target, ChevronDown, Pencil, Check, Play, OctagonX, Activity, Ban, CheckCircle2, Landmark, Wrench } from "lucide-react";
 import { toast } from "sonner";
 import { useAgentStore } from "@/stores/agent";
 import { useSSE } from "@/hooks/useSSE";
-import { ApiError, AUTH_REQUIRED_MESSAGE, api, isAuthRequiredError, type GoalSnapshot, type MandateProposal, type MandateCommitted, type LiveAction, type LiveHalted, type LiveStatus } from "@/lib/api";
+import { ApiError, AUTH_REQUIRED_MESSAGE, api, isAuthRequiredError, type GoalSnapshot, type MandateProposal, type MandateCommitted, type LiveAction, type LiveHalted, type LiveStatus, type SessionTraceEntry } from "@/lib/api";
 import { isReportWorthyRun } from "@/lib/runReports";
 import type { AgentMessage, ToolCallEntry } from "@/types/agent";
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
@@ -17,6 +17,7 @@ import { ToolProgressIndicator } from "@/components/chat/ToolProgressIndicator";
 import { MandateProposalCard } from "@/components/chat/MandateProposalCard";
 import { RunnerStatus } from "@/components/chat/RunnerStatus";
 import { SwarmStatusCard } from "@/components/chat/SwarmStatusCard";
+import { ToolTracePanel } from "@/components/chat/ToolTracePanel";
 import {
   applySwarmEvent,
   buildSwarmStatusFromStarted,
@@ -240,6 +241,9 @@ export function Agent() {
   const [goalSnapshot, setGoalSnapshot] = useState<GoalSnapshot | null>(null);
   const [goalEditActive, setGoalEditActive] = useState(false);
   const [goalEditValue, setGoalEditValue] = useState("");
+  const [traceOpen, setTraceOpen] = useState(false);
+  const [traceLoading, setTraceLoading] = useState(false);
+  const [traceEntries, setTraceEntries] = useState<SessionTraceEntry[]>([]);
 
   /* Connector runtime channel state (SPEC Consent §1/§4/§5) */
   const [liveItems, setLiveItems] = useState<LiveItem[]>([]);
@@ -413,6 +417,18 @@ export function Agent() {
     await loadSessionMessages(sid, gen);
   }, [loadSessionMessages]);
 
+  const refreshSessionTrace = useCallback(async (sid: string) => {
+    setTraceLoading(true);
+    try {
+      const trace = await api.getSessionTrace(sid);
+      if (act().sessionId === sid) setTraceEntries(trace.entries);
+    } catch {
+      if (act().sessionId === sid) setTraceEntries([]);
+    } finally {
+      if (act().sessionId === sid) setTraceLoading(false);
+    }
+  }, []);
+
   const syncCompletedAttempt = useCallback(async (sid: string, attemptId?: string) => {
     if (!attemptId) return false;
     for (let i = 0; i < 3; i += 1) {
@@ -428,6 +444,7 @@ export function Agent() {
           act().setStatus("idle");
           useAgentStore.setState({ toolCalls: [] });
           await refreshSessionMessages(sid);
+          void refreshSessionTrace(sid);
           return true;
         }
       } catch {
@@ -436,7 +453,7 @@ export function Agent() {
       await new Promise<void>((resolve) => window.setTimeout(resolve, 800));
     }
     return false;
-  }, [refreshSessionMessages]);
+  }, [refreshSessionMessages, refreshSessionTrace]);
 
   const setupSSE = useCallback((sid: string) => {
     if (sseSessionRef.current === sid) return;
@@ -744,6 +761,7 @@ export function Agent() {
       setCommittedMandates({});
       setLiveHalted(null);
       setLiveStatusRefresh((n) => n + 1);
+      setTraceEntries([]);
       if (curSid && curMsgs.length > 0) cacheSession(curSid, curMsgs);
 
       // Atomic switch: cache hit = instant, cache miss = show loading skeleton
@@ -754,6 +772,7 @@ export function Agent() {
       } else {
         loadSessionMessages(urlSessionId, gen);
       }
+      void refreshSessionTrace(urlSessionId);
       setupSSE(urlSessionId);
     } else if (urlSessionId && urlSessionId === curSid && sseSessionRef.current !== urlSessionId) {
       // #229: returning to the SAME session after the page was unmounted (user
@@ -769,6 +788,7 @@ export function Agent() {
       const seed = curMsgs.length > 0 ? curMsgs : getCachedSession(urlSessionId);
       switchSession(urlSessionId, seed);
       loadSessionMessages(urlSessionId, gen);
+      void refreshSessionTrace(urlSessionId);
       setupSSE(urlSessionId);
     } else if (!urlSessionId && curSid) {
       genRef.current += 1;
@@ -777,10 +797,11 @@ export function Agent() {
       setCommittedMandates({});
       setLiveHalted(null);
       setLiveStatusRefresh((n) => n + 1);
+      setTraceEntries([]);
       if (curSid && curMsgs.length > 0) cacheSession(curSid, curMsgs);
       reset();
     }
-  }, [urlSessionId, doDisconnect, loadSessionMessages, setupSSE, forceScrollToBottom]);
+  }, [urlSessionId, doDisconnect, loadSessionMessages, refreshSessionTrace, setupSSE, forceScrollToBottom]);
 
   /* Single shared poller for `GET /live/status`. RunnerStatus consumes this snapshot
    * as a prop rather than polling independently, and the global kill switch reads it
@@ -895,6 +916,7 @@ export function Agent() {
       setAttachment(null);
     }
     setInput("");
+    setTraceEntries([]);
     act().addMessage({ id: "", type: "user", content: finalPrompt, timestamp: Date.now() });
     act().setStatus("streaming");
     forceScrollToBottom();
@@ -1639,6 +1661,20 @@ export function Agent() {
             {messages.length > 0 && (
               <button
                 type="button"
+                onClick={() => {
+                  setTraceOpen(true);
+                  const sid = act().sessionId;
+                  if (sid) void refreshSessionTrace(sid);
+                }}
+                className="px-3 py-2.5 rounded-xl border text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                title="查看完整工具与 Skill 调用记录"
+              >
+                <Wrench className="h-4 w-4" />
+              </button>
+            )}
+            {messages.length > 0 && (
+              <button
+                type="button"
                 onClick={handleExport}
                 className="px-3 py-2.5 rounded-xl border text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
                 title={t('agent.exportChat')}
@@ -1667,6 +1703,12 @@ export function Agent() {
           </div>
         </div>
       </form>
+      <ToolTracePanel
+        open={traceOpen}
+        loading={traceLoading}
+        entries={traceEntries}
+        onClose={() => setTraceOpen(false)}
+      />
     </div>
   );
 }

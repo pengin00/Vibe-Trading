@@ -22,6 +22,7 @@ from pathlib import Path
 
 _ALLOWED_FILE_ROOTS_ENV = "VIBE_TRADING_ALLOWED_FILE_ROOTS"
 _ALLOWED_RUN_ROOTS_ENV = "VIBE_TRADING_ALLOWED_RUN_ROOTS"
+_LEGACY_CONTAINER_AGENT_ROOTS = ("/app/agent",)
 
 
 def _rejects_unc(p: str) -> None:
@@ -45,13 +46,29 @@ def safe_path(p: str, workdir: Path) -> Path:
             `workdir`. Callers surface this back to the LLM as a tool error.
     """
     _rejects_unc(p)
-    base = Path(workdir).resolve()
-    resolved = (base / p).resolve()
+    base = normalize_run_path(workdir).resolve()
+    candidate = normalize_run_path(p)
+    resolved = (base / candidate).resolve()
     try:
         resolved.relative_to(base)
     except ValueError as exc:
         raise ValueError(f"Path {p!r} escapes the workspace root") from exc
     return resolved
+
+
+def normalize_run_path(p: str | Path) -> Path:
+    """Map legacy container run paths to the current local agent root.
+
+    Older Docker sessions can leave paths like ``/app/agent/runs/...`` in
+    conversation history. Local runs live under the checkout's ``agent/`` dir,
+    so normalize those historical paths before allowlist checks.
+    """
+    raw = str(p)
+    for legacy_root in _LEGACY_CONTAINER_AGENT_ROOTS:
+        if raw == legacy_root or raw.startswith(f"{legacy_root}/"):
+            suffix = raw[len(legacy_root):].lstrip("/")
+            return (_agent_root() / suffix).resolve()
+    return Path(raw).expanduser()
 
 
 def _agent_root() -> Path:
@@ -121,7 +138,7 @@ def _allowed_run_roots() -> list[Path]:
         if not item:
             continue
         _rejects_unc(item)
-        configured.append(Path(item).expanduser().resolve())
+        configured.append(normalize_run_path(item).resolve())
 
     roots: list[Path] = []
     for root in [*_default_run_roots(), *configured]:
@@ -223,7 +240,7 @@ def safe_run_dir(p: str) -> Path:
             roots.
     """
     _rejects_unc(p)
-    resolved = Path(p).expanduser().resolve()
+    resolved = normalize_run_path(p).resolve()
 
     for root in _allowed_run_roots():
         if resolved.is_relative_to(root):

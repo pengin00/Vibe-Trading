@@ -7,6 +7,7 @@ import subprocess
 from typing import Any
 
 from src.agent.tools import BaseTool
+from src.tools.path_utils import safe_run_dir
 
 _OUTPUT_LIMIT = 50_000
 _DEFAULT_TIMEOUT = 120
@@ -38,6 +39,14 @@ class BashTool(BaseTool):
         """
         command = kwargs["command"]
         cwd = kwargs.get("run_dir")
+        if cwd:
+            try:
+                cwd = str(safe_run_dir(str(cwd)))
+            except ValueError as exc:
+                return json.dumps({
+                    "status": "error",
+                    "error": str(exc),
+                }, ensure_ascii=False)
 
         try:
             result = subprocess.run(

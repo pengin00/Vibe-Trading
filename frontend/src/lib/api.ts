@@ -56,6 +56,25 @@ export interface UploadResult {
   filename: string;
 }
 
+export interface SessionTraceEntry {
+  type: "tool_call" | "tool_result" | "skill_call" | "skill_result" | string;
+  ts?: number | null;
+  iter?: number | null;
+  tool?: string | null;
+  call_id?: string | null;
+  status?: string | null;
+  elapsed_ms?: number | null;
+  args?: Record<string, unknown> | null;
+  result?: string | null;
+  preview?: string | null;
+  skill_name?: string | null;
+}
+
+export interface SessionTraceResponse {
+  session_id: string;
+  entries: SessionTraceEntry[];
+}
+
 async function uploadFile(file: File): Promise<UploadResult> {
   const form = new FormData();
   form.append("file", file);
@@ -90,6 +109,7 @@ export const api = {
   sendMessage: (sid: string, content: string) => request<{ message_id: string; attempt_id: string }>(`/sessions/${sid}/messages`, { method: "POST", body: JSON.stringify({ content }) }),
   cancelSession: (sid: string) => request<{ status: string }>(`/sessions/${sid}/cancel`, { method: "POST" }),
   getSessionMessages: (sid: string) => request<MessageItem[]>(`/sessions/${sid}/messages`),
+  getSessionTrace: (sid: string) => request<SessionTraceResponse>(`/sessions/${sid}/trace`),
   createGoal: (sid: string, body: CreateGoalRequest) =>
     request<GoalSnapshot>(`/sessions/${sid}/goal`, {
       method: "POST",

@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from src.agent.memory import WorkspaceMemory
+from src.agent.research_guard import GROUNDING_PROMPT, resolve_grounding_policy
 from src.agent.skills import SkillsLoader
 from src.agent.tools import ToolRegistry
 
@@ -73,6 +74,8 @@ Decide which workflow to use based on the request:
 
 - Load the relevant skill BEFORE starting any task. Skills contain the exact API contracts and examples.
 - Ask the user if critical info is missing (assets, dates, strategy type). Never guess.
+- Do NOT guess artifact filenames or read files that were not created or returned by a prior tool in this run. Use `read_file` only for files you wrote, files explicitly returned by tools, uploaded files, or known skill docs.
+- If a tool is unavailable or a data source fails, switch to an available listed tool/source or clearly report the missing capability. Do not emit raw pseudo tool markup such as `<invoke name="...">`; call the actual tool through the tool-calling interface.
 - Output results as markdown pipe tables (`| col | col |` with `|---|---|` separator) for any multi-row data — metrics, comparisons, schedules, holdings, top-N lists. Renderers upgrade these to native tables. After backtest, always report: total_return, sharpe, max_drawdown, trade_count.
 - Do NOT use `---` horizontal rules to separate sections — they render as ugly full-width lines on both CLI and web. Use `##` / `###` markdown headings instead.
 - All file paths are relative to run_dir (auto-injected).
@@ -80,6 +83,7 @@ Decide which workflow to use based on the request:
 - You have persistent cross-session memory (`remember` tool). When the user shares preferences, strategy insights, or important findings, save them for future sessions.
 - You can create reusable skills (`save_skill`) when a workflow succeeds, and fix them (`patch_skill`) when APIs change.
 {memory_section}
+{grounding_section}
 ## Current Date & Time
 
 Today is {current_datetime}.
@@ -146,6 +150,11 @@ class ContextBuilder:
             skill_descriptions=self.skills_loader.get_descriptions(),
             memory_summary=self.memory.to_summary(),
             memory_section=memory_section,
+            grounding_section=(
+                GROUNDING_PROMPT
+                if resolve_grounding_policy(user_message).required
+                else ""
+            ),
             current_datetime=now.strftime("%A, %B %d, %Y %H:%M (local)"),
         )
 
