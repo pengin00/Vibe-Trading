@@ -1,4 +1,5 @@
 .venv/
+.venv311/
 agent/.venv/
 __pycache__/
 .pytest_cache/
@@ -23,10 +24,14 @@ CLAUDE.md
 .vscode/
 learn-claude-code-main/
 agent/sessions/
+agent/sessions
 agent/runs/
+agent/runs
 agent/.ui_runtime/
 agent/.tasks/
+agent/.swarm/
 agent/uploads/
+agent/uploads
 agent/tests/*_result.json
 .ruff_cache/
 frontend/dist/
@@ -39,6 +44,7 @@ wiki/.wrangler/
 .wrangler/
 wiki/.cache/
 .vibe-dev/
+.vibe-local/
 .vibe-record/
 .cache/
 .remotion/

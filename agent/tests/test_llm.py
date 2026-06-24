@@ -8,7 +8,14 @@ from unittest.mock import patch
 import pytest
 
 from src.providers.capabilities import get_provider_capabilities, provider_env_names
-from src.providers.llm import _sync_provider_env, build_llm
+from src.providers.llm import (
+    MiniMaxAnthropicChat,
+    _anthropic_messages_url,
+    _convert_openai_messages_to_anthropic,
+    _convert_openai_tools_to_anthropic,
+    _sync_provider_env,
+    build_llm,
+)
 
 
 class TestProviderCapabilityAliases:
@@ -170,6 +177,69 @@ class TestSyncProviderEnv:
         assert "minimax.io" in result["OPENAI_BASE_URL"]
 
 
+class TestMinimaxAnthropicAdapter:
+    """MiniMax Anthropic-compatible endpoint support."""
+
+    def test_messages_url_from_base_url(self) -> None:
+        assert (
+            _anthropic_messages_url("https://api.minimaxi.com/anthropic")
+            == "https://api.minimaxi.com/anthropic/v1/messages"
+        )
+        assert (
+            _anthropic_messages_url("https://api.minimaxi.com/anthropic/v1")
+            == "https://api.minimaxi.com/anthropic/v1/messages"
+        )
+
+    def test_build_llm_uses_anthropic_adapter_for_minimaxi_anthropic_url(self) -> None:
+        import src.providers.llm as llm_mod
+        llm_mod._dotenv_loaded = True
+
+        env = {
+            "LANGCHAIN_PROVIDER": "minimax",
+            "MINIMAX_API_KEY": "minimax-key",
+            "MINIMAX_BASE_URL": "https://api.minimaxi.com/anthropic",
+            "LANGCHAIN_MODEL_NAME": "MiniMax-M3",
+            "LANGCHAIN_TEMPERATURE": "0.7",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            llm = build_llm()
+
+        assert isinstance(llm, MiniMaxAnthropicChat)
+        assert llm.base_url == "https://api.minimaxi.com/anthropic"
+        assert llm.model == "MiniMax-M3"
+
+    def test_openai_messages_and_tools_convert_to_anthropic(self) -> None:
+        system, messages = _convert_openai_messages_to_anthropic([
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"symbol\":\"BTC\"}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ])
+        tools = _convert_openai_tools_to_anthropic([{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup a symbol",
+                "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}}},
+            },
+        }])
+
+        assert system == "You are helpful."
+        assert messages[0]["role"] == "user"
+        assert messages[1]["content"][0]["type"] == "tool_use"
+        assert messages[1]["content"][0]["input"] == {"symbol": "BTC"}
+        assert messages[2]["content"][0]["type"] == "tool_result"
+        assert tools[0]["input_schema"]["properties"]["symbol"]["type"] == "string"
+
+
 # ---------------------------------------------------------------------------
 # MiniMax temperature clamping
 # ---------------------------------------------------------------------------
@@ -274,4 +344,3 @@ class TestReasoningEffortPassthrough:
             "LANGCHAIN_REASONING_EFFORT": "HIGH",
         })
         assert captured["extra_body"]["reasoning"]["effort"] == "high"
-

@@ -5,12 +5,14 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Sequence
+from copy import copy
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
+import httpx
 from pydantic import PrivateAttr
 
 from src.providers.capabilities import get_provider_capabilities, provider_env_names
@@ -302,6 +304,126 @@ logger = logging.getLogger(__name__)
 _dotenv_loaded: bool = False
 
 
+class MiniMaxAnthropicChat:
+    """Small Anthropic Messages adapter for MiniMax's Anthropic-compatible API."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_key: str,
+        base_url: str,
+        temperature: float,
+        timeout: int,
+        max_retries: int,
+        callbacks: Any = None,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.model = model
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.temperature = temperature
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.callbacks = callbacks
+        self._tools = tools or []
+
+    def bind_tools(self, tools: list[dict[str, Any]] | None) -> "MiniMaxAnthropicChat":
+        bound = copy(self)
+        bound._tools = tools or []
+        return bound
+
+    def invoke(self, messages: list[dict[str, Any]], config: dict[str, Any] | None = None) -> Any:
+        from langchain_core.messages import AIMessage
+
+        payload = self._build_payload(messages)
+        timeout = int((config or {}).get("timeout") or self.timeout)
+        response = self._post_messages(payload, timeout=timeout)
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        for block in response.get("content", []) or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and block.get("text"):
+                text_parts.append(str(block["text"]))
+            elif block.get("type") == "tool_use":
+                tool_calls.append(
+                    {
+                        "id": str(block.get("id") or ""),
+                        "name": str(block.get("name") or ""),
+                        "args": block.get("input") if isinstance(block.get("input"), dict) else {},
+                    }
+                )
+
+        usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        usage_metadata = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        } if usage else None
+
+        return AIMessage(
+            content="".join(text_parts),
+            tool_calls=tool_calls,
+            response_metadata={
+                "finish_reason": _map_anthropic_stop_reason(response.get("stop_reason")),
+                "model": response.get("model", self.model),
+                "id": response.get("id"),
+            },
+            usage_metadata=usage_metadata,
+        )
+
+    def stream(self, messages: list[dict[str, Any]], config: dict[str, Any] | None = None) -> Any:
+        # The surrounding AgentLoop accepts a single full AIMessage here and still
+        # streams progress through its own run events. Keeping this path
+        # non-streaming preserves tool-call parsing across Anthropic-compatible
+        # relays whose SSE dialects vary.
+        yield self.invoke(messages, config=config)
+
+    def _post_messages(self, payload: dict[str, Any], *, timeout: int) -> dict[str, Any]:
+        url = _anthropic_messages_url(self.base_url)
+        headers = {
+            "content-type": "application/json",
+            "x-api-key": self.api_key,
+            "anthropic-version": os.getenv("ANTHROPIC_VERSION", "2023-06-01"),
+        }
+        last_exc: Exception | None = None
+        for attempt in range(max(self.max_retries, 0) + 1):
+            try:
+                with httpx.Client(timeout=timeout) as client:
+                    response = client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise RuntimeError("MiniMax Anthropic response is not a JSON object")
+                return data
+            except Exception as exc:  # noqa: BLE001 - preserve provider exception details
+                last_exc = exc
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status is not None and 400 <= status < 500 and status not in (408, 429):
+                    break
+                if attempt >= self.max_retries:
+                    break
+        assert last_exc is not None
+        raise last_exc
+
+    def _build_payload(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        system, anthropic_messages = _convert_openai_messages_to_anthropic(messages)
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": int(os.getenv("LANGCHAIN_MAX_TOKENS", "4096")),
+            "temperature": self.temperature,
+            "messages": anthropic_messages,
+        }
+        if system:
+            payload["system"] = system
+        if self._tools:
+            payload["tools"] = _convert_openai_tools_to_anthropic(self._tools)
+        return payload
+
+
 def _redact_env_source(loaded: Path | None) -> str:
     """Map a resolved `.env` candidate to a stable, leak-free label.
 
@@ -379,6 +501,154 @@ def _deepseek_adapter_mode() -> str:
         "openai_compatible": "openai-compatible",
     }
     return aliases.get(mode, mode or "auto")
+
+
+def _is_minimax_anthropic_url(base_url: str) -> bool:
+    """Return whether the MiniMax base URL selects the Anthropic-compatible API."""
+    try:
+        parsed = urlsplit(base_url.strip())
+    except ValueError:
+        return False
+    return parsed.hostname == "api.minimaxi.com" and "/anthropic" in parsed.path.rstrip("/")
+
+
+def _anthropic_messages_url(base_url: str) -> str:
+    """Build the Messages endpoint from an Anthropic-compatible base URL."""
+    url = base_url.strip().rstrip("/")
+    if url.endswith("/v1/messages"):
+        return url
+    if url.endswith("/messages"):
+        return url
+    if url.endswith("/v1"):
+        return f"{url}/messages"
+    return f"{url}/v1/messages"
+
+
+def _map_anthropic_stop_reason(reason: Any) -> str:
+    """Map Anthropic stop reasons to the finish reasons used by ChatLLM."""
+    mapping = {
+        "end_turn": "stop",
+        "stop_sequence": "stop",
+        "max_tokens": "length",
+        "tool_use": "tool_calls",
+    }
+    return mapping.get(str(reason or ""), str(reason or "stop"))
+
+
+def _message_role(message: Any) -> str:
+    if isinstance(message, dict):
+        return str(message.get("role") or "")
+    return str(getattr(message, "type", "") or getattr(message, "role", ""))
+
+
+def _message_content(message: Any) -> Any:
+    if isinstance(message, dict):
+        return message.get("content", "")
+    return getattr(message, "content", "")
+
+
+def _message_tool_calls(message: Any) -> Any:
+    if isinstance(message, dict):
+        return message.get("tool_calls") or []
+    return getattr(message, "tool_calls", []) or []
+
+
+def _message_tool_call_id(message: Any) -> str:
+    if isinstance(message, dict):
+        return str(message.get("tool_call_id") or "")
+    return str(getattr(message, "tool_call_id", "") or "")
+
+
+def _append_anthropic_message(messages: list[dict[str, Any]], role: str, content: Any) -> None:
+    """Append while merging consecutive same-role Anthropic messages."""
+    blocks = content if isinstance(content, list) else [{"type": "text", "text": str(content or "")}]
+    if messages and messages[-1]["role"] == role:
+        previous = messages[-1]["content"]
+        if isinstance(previous, list):
+            previous.extend(blocks)
+        else:
+            messages[-1]["content"] = [{"type": "text", "text": str(previous)}] + blocks
+        return
+    messages.append({"role": role, "content": blocks})
+
+
+def _convert_openai_messages_to_anthropic(messages: list[Any]) -> tuple[str | None, list[dict[str, Any]]]:
+    """Translate OpenAI/LangChain chat messages to Anthropic Messages format."""
+    system_parts: list[str] = []
+    converted: list[dict[str, Any]] = []
+    for message in messages:
+        role = _message_role(message)
+        content = _message_content(message)
+        if role in {"system", "developer"}:
+            if content:
+                system_parts.append(str(content))
+            continue
+        if role == "tool":
+            _append_anthropic_message(
+                converted,
+                "user",
+                [{
+                    "type": "tool_result",
+                    "tool_use_id": _message_tool_call_id(message),
+                    "content": str(content or ""),
+                }],
+            )
+            continue
+
+        anthropic_role = "assistant" if role in {"assistant", "ai"} else "user"
+        blocks: list[dict[str, Any]] = []
+        if content:
+            blocks.append({"type": "text", "text": str(content)})
+        for tool_call in _message_tool_calls(message):
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+            name = tool_call.get("name") or function.get("name")
+            args = tool_call.get("args") or tool_call.get("arguments") or function.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    import json
+
+                    args = json.loads(args)
+                except Exception:  # noqa: BLE001 - provider may emit non-JSON arguments
+                    args = {}
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": str(tool_call.get("id") or ""),
+                    "name": str(name or ""),
+                    "input": args if isinstance(args, dict) else {},
+                }
+            )
+        if not blocks:
+            blocks.append({"type": "text", "text": ""})
+        _append_anthropic_message(converted, anthropic_role, blocks)
+    if not converted:
+        converted.append({"role": "user", "content": [{"type": "text", "text": ""}]})
+    return ("\n\n".join(system_parts) if system_parts else None), converted
+
+
+def _convert_openai_tools_to_anthropic(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Translate OpenAI function tools to Anthropic tool definitions."""
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = function.get("name")
+        if not name:
+            continue
+        converted.append(
+            {
+                "name": str(name),
+                "description": str(function.get("description") or ""),
+                "input_schema": function.get("parameters") if isinstance(function.get("parameters"), dict) else {
+                    "type": "object",
+                    "properties": {},
+                },
+            }
+        )
+    return converted
 
 
 def _build_native_deepseek(
@@ -608,6 +878,24 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
                 raise RuntimeError(
                     "VIBE_TRADING_DEEPSEEK_ADAPTER=native requires langchain-deepseek"
                 )
+
+    key_env, base_env = provider_env_names(provider, name)
+    provider_base_url = os.getenv(base_env, "") or os.getenv("OPENAI_BASE_URL", "") or os.getenv("OPENAI_API_BASE", "")
+    if provider == "minimax" and _is_minimax_anthropic_url(provider_base_url):
+        api_key = os.getenv(key_env or "", "") or os.getenv("OPENAI_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("MINIMAX_API_KEY is not set")
+        if temperature <= 0.0:
+            temperature = 0.01
+        return MiniMaxAnthropicChat(
+            model=name,
+            api_key=api_key,
+            base_url=provider_base_url,
+            temperature=temperature,
+            timeout=int(os.getenv("TIMEOUT_SECONDS", "120")),
+            max_retries=int(os.getenv("MAX_RETRIES", "2")),
+            callbacks=callbacks,
+        )
 
     if ChatOpenAI is None:
         raise RuntimeError("langchain-openai is not installed")
