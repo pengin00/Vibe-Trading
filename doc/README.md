@@ -10,6 +10,7 @@
 - [部署与启动](./deployment.md)
 - [REST API 与长任务结果获取](./api.md)
 - [运行数据与持久化](./data-storage.md)
+- [投资工作台模块设计](./investment-workspace-design.md)
 
 ## 项目定位
 
@@ -61,4 +62,3 @@ vibe-trading
 # MCP Server
 vibe-trading-mcp
 ```
-
