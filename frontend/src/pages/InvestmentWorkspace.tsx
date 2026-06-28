@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { BriefcaseBusiness, CheckCircle2, ClipboardList, FileText, ImageUp, LineChart, Loader2, Plus, RefreshCw, Target, TriangleAlert } from "lucide-react";
+import { BriefcaseBusiness, CheckCircle2, ClipboardList, FileText, ImageUp, LineChart, Loader2, Pencil, Plus, RefreshCw, Save, Target, Trash2, TriangleAlert, X } from "lucide-react";
 import { toast } from "sonner";
 import { api, ApiError, type PortfolioDashboard, type PortfolioDecision, type PortfolioInstrument, type PortfolioPosition, type PortfolioResearchReport, type PortfolioWatchlistItem, type PositionImportItemPatch, type PositionImportJob } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -41,6 +41,12 @@ export function InvestmentWorkspace() {
   const [importJobs, setImportJobs] = useState<PositionImportJob[]>([]);
   const [activeImport, setActiveImport] = useState<PositionImportJob | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [editingInstrumentId, setEditingInstrumentId] = useState<string | null>(null);
+  const [instrumentDraft, setInstrumentDraft] = useState<Record<string, string>>({});
+  const [editingWatchlistId, setEditingWatchlistId] = useState<string | null>(null);
+  const [watchlistDraft, setWatchlistDraft] = useState<Record<string, string>>({});
+  const [editingPositionId, setEditingPositionId] = useState<string | null>(null);
+  const [positionDraft, setPositionDraft] = useState<Record<string, string>>({});
   const [instrumentForm, setInstrumentForm] = useState({ symbol: "", name: "", market: "US", asset_class: "equity", currency: "USD", tags: "", thesis: "" });
   const [positionForm, setPositionForm] = useState({ instrument_id: "", quantity: "", avg_cost: "", target_weight: "", notes: "" });
   const [decisionForm, setDecisionForm] = useState({ instrument_id: "", decision_type: "watch", title: "", rationale: "" });
@@ -123,6 +129,145 @@ export function InvestmentWorkspace() {
       await load();
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : "保存持仓失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const startEditInstrument = (item: PortfolioInstrument) => {
+    setEditingInstrumentId(item.id);
+    setInstrumentDraft({
+      symbol: item.symbol,
+      name: item.name,
+      market: item.market,
+      tags: item.tags?.join(", ") || "",
+      thesis: item.thesis || "",
+    });
+  };
+
+  const saveInstrument = async (id: string) => {
+    setSaving(true);
+    try {
+      await api.portfolio.updateInstrument(id, {
+        symbol: instrumentDraft.symbol?.trim().toUpperCase(),
+        name: instrumentDraft.name?.trim(),
+        market: instrumentDraft.market?.trim().toUpperCase(),
+        tags: (instrumentDraft.tags || "").split(",").map((tag) => tag.trim()).filter(Boolean),
+        thesis: instrumentDraft.thesis || null,
+      });
+      setEditingInstrumentId(null);
+      toast.success("标的已更新");
+      await load();
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "更新标的失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const deleteInstrument = async (id: string) => {
+    if (!window.confirm("确认删除/停用这个投资标的吗？")) return;
+    setSaving(true);
+    try {
+      await api.portfolio.deleteInstrument(id);
+      toast.success("标的已删除");
+      await load();
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "删除标的失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const startEditWatchlist = (item: PortfolioWatchlistItem) => {
+    setEditingWatchlistId(item.id);
+    setWatchlistDraft({
+      priority: String(item.priority ?? 3),
+      status: item.status || "watching",
+      target_price: item.target_price?.toString() || "",
+      alert_price_low: item.alert_price_low?.toString() || "",
+      alert_price_high: item.alert_price_high?.toString() || "",
+      notes: item.notes || "",
+    });
+  };
+
+  const saveWatchlist = async (id: string) => {
+    setSaving(true);
+    try {
+      await api.portfolio.updateWatchlistItem(id, {
+        priority: Number(watchlistDraft.priority || 3),
+        status: watchlistDraft.status || "watching",
+        target_price: watchlistDraft.target_price ? Number(watchlistDraft.target_price) : null,
+        alert_price_low: watchlistDraft.alert_price_low ? Number(watchlistDraft.alert_price_low) : null,
+        alert_price_high: watchlistDraft.alert_price_high ? Number(watchlistDraft.alert_price_high) : null,
+        notes: watchlistDraft.notes || null,
+      });
+      setEditingWatchlistId(null);
+      toast.success("关注项已更新");
+      await load();
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "更新关注项失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const deleteWatchlist = async (id: string) => {
+    if (!window.confirm("确认从关注列表移除吗？")) return;
+    setSaving(true);
+    try {
+      await api.portfolio.deleteWatchlistItem(id);
+      toast.success("关注项已删除");
+      await load();
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "删除关注项失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const startEditPosition = (item: PortfolioPosition) => {
+    setEditingPositionId(item.id);
+    setPositionDraft({
+      quantity: String(item.quantity ?? ""),
+      avg_cost: String(item.avg_cost ?? ""),
+      target_weight: item.target_weight?.toString() || "",
+      stop_loss: item.stop_loss?.toString() || "",
+      take_profit: item.take_profit?.toString() || "",
+      notes: item.notes || "",
+    });
+  };
+
+  const savePosition = async (id: string) => {
+    setSaving(true);
+    try {
+      await api.portfolio.updatePosition(id, {
+        quantity: Number(positionDraft.quantity || 0),
+        avg_cost: Number(positionDraft.avg_cost || 0),
+        target_weight: positionDraft.target_weight ? Number(positionDraft.target_weight) : null,
+        stop_loss: positionDraft.stop_loss ? Number(positionDraft.stop_loss) : null,
+        take_profit: positionDraft.take_profit ? Number(positionDraft.take_profit) : null,
+        notes: positionDraft.notes || null,
+      });
+      setEditingPositionId(null);
+      toast.success("持仓已更新");
+      await load();
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "更新持仓失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const deletePosition = async (id: string) => {
+    if (!window.confirm("确认删除这个持仓吗？")) return;
+    setSaving(true);
+    try {
+      await api.portfolio.deletePosition(id);
+      toast.success("持仓已删除");
+      await load();
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "删除持仓失败");
     } finally {
       setSaving(false);
     }
@@ -287,6 +432,96 @@ export function InvestmentWorkspace() {
           <Stat label="标的 / 持仓" value={`${dashboard?.instruments ?? 0} / ${dashboard?.positions ?? 0}`} />
         </div>
 
+        <section className="rounded-md border bg-card">
+          <div className="flex items-center gap-2 border-b px-4 py-3">
+            <ClipboardList className="h-4 w-4 text-primary" />
+            <h2 className="text-sm font-semibold">当前持仓</h2>
+          </div>
+          <div className="overflow-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-muted/50 text-xs text-muted-foreground">
+                <tr><th className="px-3 py-2 text-left">标的</th><th className="px-3 py-2 text-right">数量</th><th className="px-3 py-2 text-right">均价</th><th className="px-3 py-2 text-right">目标权重</th><th className="px-3 py-2 text-right">止损/止盈</th><th className="px-3 py-2 text-right">市值</th><th className="px-3 py-2 text-right">盈亏</th><th className="px-3 py-2 text-left">备注</th><th className="px-3 py-2 text-right">操作</th></tr>
+              </thead>
+              <tbody>
+                {positions.length ? positions.map((item) => {
+                  const editing = editingPositionId === item.id;
+                  return (
+                  <tr key={item.id} className="border-t align-top">
+                    <td className="px-3 py-2 font-medium">{item.instrument?.symbol ?? item.instrument_id}</td>
+                    <td className="px-3 py-2 text-right">{editing ? <input className="w-24 rounded-md border bg-background px-2 py-1 text-right" value={positionDraft.quantity || ""} onChange={(e) => setPositionDraft({ ...positionDraft, quantity: e.target.value })} /> : money(item.quantity)}</td>
+                    <td className="px-3 py-2 text-right">{editing ? <input className="w-24 rounded-md border bg-background px-2 py-1 text-right" value={positionDraft.avg_cost || ""} onChange={(e) => setPositionDraft({ ...positionDraft, avg_cost: e.target.value })} /> : money(item.avg_cost)}</td>
+                    <td className="px-3 py-2 text-right">{editing ? <input className="w-20 rounded-md border bg-background px-2 py-1 text-right" value={positionDraft.target_weight || ""} onChange={(e) => setPositionDraft({ ...positionDraft, target_weight: e.target.value })} /> : (item.target_weight != null ? pctFmt.format(item.target_weight) : "-")}</td>
+                    <td className="px-3 py-2 text-right">{editing ? <div className="flex justify-end gap-1"><input className="w-20 rounded-md border bg-background px-2 py-1 text-right" placeholder="止损" value={positionDraft.stop_loss || ""} onChange={(e) => setPositionDraft({ ...positionDraft, stop_loss: e.target.value })} /><input className="w-20 rounded-md border bg-background px-2 py-1 text-right" placeholder="止盈" value={positionDraft.take_profit || ""} onChange={(e) => setPositionDraft({ ...positionDraft, take_profit: e.target.value })} /></div> : `${item.stop_loss ?? "-"} / ${item.take_profit ?? "-"}`}</td>
+                    <td className="px-3 py-2 text-right">{money(item.market_value)}</td>
+                    <td className={cn("px-3 py-2 text-right", item.unrealized_pnl >= 0 ? "text-success" : "text-danger")}>{money(item.unrealized_pnl)} · {pctFmt.format(item.unrealized_pnl_pct || 0)}</td>
+                    <td className="max-w-[280px] px-3 py-2 text-muted-foreground">{editing ? <input className="w-full rounded-md border bg-background px-2 py-1" value={positionDraft.notes || ""} onChange={(e) => setPositionDraft({ ...positionDraft, notes: e.target.value })} /> : <span className="line-clamp-2">{item.notes || "-"}</span>}</td>
+                    <td className="px-3 py-2">
+                      <div className="flex justify-end gap-1">
+                        {editing ? (
+                          <>
+                            <button onClick={() => savePosition(item.id)} className="rounded-md border p-1.5 hover:bg-muted" title="保存"><Save className="h-4 w-4" /></button>
+                            <button onClick={() => setEditingPositionId(null)} className="rounded-md border p-1.5 hover:bg-muted" title="取消"><X className="h-4 w-4" /></button>
+                          </>
+                        ) : (
+                          <>
+                            <button onClick={() => startEditPosition(item)} className="rounded-md border p-1.5 hover:bg-muted" title="编辑"><Pencil className="h-4 w-4" /></button>
+                            <button onClick={() => deletePosition(item.id)} className="rounded-md border p-1.5 text-danger hover:bg-danger/10" title="删除"><Trash2 className="h-4 w-4" /></button>
+                          </>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                )}) : <EmptyRow colSpan={9} text={loading ? "加载中..." : "暂无持仓"} />}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="rounded-md border bg-card">
+          <div className="flex items-center gap-2 border-b px-4 py-3">
+            <Target className="h-4 w-4 text-primary" />
+            <h2 className="text-sm font-semibold">关注列表管理</h2>
+          </div>
+          <div className="overflow-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-muted/50 text-xs text-muted-foreground">
+                <tr><th className="px-3 py-2 text-left">标的</th><th className="px-3 py-2 text-left">状态</th><th className="px-3 py-2 text-right">优先级</th><th className="px-3 py-2 text-right">目标价</th><th className="px-3 py-2 text-right">低预警</th><th className="px-3 py-2 text-right">高预警</th><th className="px-3 py-2 text-left">备注</th><th className="px-3 py-2 text-right">操作</th></tr>
+              </thead>
+              <tbody>
+                {watchlist.length ? watchlist.map((item) => {
+                  const editing = editingWatchlistId === item.id;
+                  return (
+                    <tr key={item.id} className="border-t align-top">
+                      <td className="px-3 py-2 font-medium">{item.instrument?.symbol ?? item.instrument_id}<div className="text-xs font-normal text-muted-foreground">{item.instrument?.name}</div></td>
+                      <td className="px-3 py-2">{editing ? <input className="w-28 rounded-md border bg-background px-2 py-1" value={watchlistDraft.status || ""} onChange={(e) => setWatchlistDraft({ ...watchlistDraft, status: e.target.value })} /> : item.status}</td>
+                      <td className="px-3 py-2 text-right">{editing ? <input className="w-16 rounded-md border bg-background px-2 py-1 text-right" value={watchlistDraft.priority || ""} onChange={(e) => setWatchlistDraft({ ...watchlistDraft, priority: e.target.value })} /> : item.priority}</td>
+                      <td className="px-3 py-2 text-right">{editing ? <input className="w-20 rounded-md border bg-background px-2 py-1 text-right" value={watchlistDraft.target_price || ""} onChange={(e) => setWatchlistDraft({ ...watchlistDraft, target_price: e.target.value })} /> : money(item.target_price)}</td>
+                      <td className="px-3 py-2 text-right">{editing ? <input className="w-20 rounded-md border bg-background px-2 py-1 text-right" value={watchlistDraft.alert_price_low || ""} onChange={(e) => setWatchlistDraft({ ...watchlistDraft, alert_price_low: e.target.value })} /> : money(item.alert_price_low)}</td>
+                      <td className="px-3 py-2 text-right">{editing ? <input className="w-20 rounded-md border bg-background px-2 py-1 text-right" value={watchlistDraft.alert_price_high || ""} onChange={(e) => setWatchlistDraft({ ...watchlistDraft, alert_price_high: e.target.value })} /> : money(item.alert_price_high)}</td>
+                      <td className="max-w-[260px] px-3 py-2 text-muted-foreground">{editing ? <input className="w-full rounded-md border bg-background px-2 py-1" value={watchlistDraft.notes || ""} onChange={(e) => setWatchlistDraft({ ...watchlistDraft, notes: e.target.value })} /> : <span className="line-clamp-2">{item.notes || "-"}</span>}</td>
+                      <td className="px-3 py-2">
+                        <div className="flex justify-end gap-1">
+                          {editing ? (
+                            <>
+                              <button onClick={() => saveWatchlist(item.id)} className="rounded-md border p-1.5 hover:bg-muted" title="保存"><Save className="h-4 w-4" /></button>
+                              <button onClick={() => setEditingWatchlistId(null)} className="rounded-md border p-1.5 hover:bg-muted" title="取消"><X className="h-4 w-4" /></button>
+                            </>
+                          ) : (
+                            <>
+                              <button onClick={() => startEditWatchlist(item)} className="rounded-md border p-1.5 hover:bg-muted" title="编辑"><Pencil className="h-4 w-4" /></button>
+                              <button onClick={() => deleteWatchlist(item.id)} className="rounded-md border p-1.5 text-danger hover:bg-danger/10" title="删除"><Trash2 className="h-4 w-4" /></button>
+                            </>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                }) : <EmptyRow colSpan={8} text={loading ? "加载中..." : "暂无关注项"} />}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
         <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
           <section className="rounded-md border bg-card">
             <div className="flex items-center gap-2 border-b px-4 py-3">
@@ -307,18 +542,35 @@ export function InvestmentWorkspace() {
             <div className="overflow-auto">
               <table className="w-full text-sm">
                 <thead className="bg-muted/50 text-xs text-muted-foreground">
-                  <tr><th className="px-3 py-2 text-left">代码</th><th className="px-3 py-2 text-left">名称</th><th className="px-3 py-2 text-left">市场</th><th className="px-3 py-2 text-left">标签</th><th className="px-3 py-2 text-left">假设</th></tr>
+                  <tr><th className="px-3 py-2 text-left">代码</th><th className="px-3 py-2 text-left">名称</th><th className="px-3 py-2 text-left">市场</th><th className="px-3 py-2 text-left">标签</th><th className="px-3 py-2 text-left">假设</th><th className="px-3 py-2 text-right">操作</th></tr>
                 </thead>
                 <tbody>
-                  {instruments.length ? instruments.map((item) => (
-                    <tr key={item.id} className="border-t">
-                      <td className="px-3 py-2 font-medium">{item.symbol}</td>
-                      <td className="px-3 py-2">{item.name}</td>
-                      <td className="px-3 py-2">{item.market}</td>
-                      <td className="px-3 py-2">{item.tags?.join(", ") || "-"}</td>
-                      <td className="max-w-[320px] truncate px-3 py-2 text-muted-foreground">{item.thesis || "-"}</td>
+                  {instruments.length ? instruments.map((item) => {
+                    const editing = editingInstrumentId === item.id;
+                    return (
+                    <tr key={item.id} className="border-t align-top">
+                      <td className="px-3 py-2 font-medium">{editing ? <input className="w-24 rounded-md border bg-background px-2 py-1" value={instrumentDraft.symbol || ""} onChange={(e) => setInstrumentDraft({ ...instrumentDraft, symbol: e.target.value })} /> : item.symbol}</td>
+                      <td className="px-3 py-2">{editing ? <input className="w-32 rounded-md border bg-background px-2 py-1" value={instrumentDraft.name || ""} onChange={(e) => setInstrumentDraft({ ...instrumentDraft, name: e.target.value })} /> : item.name}</td>
+                      <td className="px-3 py-2">{editing ? <input className="w-20 rounded-md border bg-background px-2 py-1" value={instrumentDraft.market || ""} onChange={(e) => setInstrumentDraft({ ...instrumentDraft, market: e.target.value })} /> : item.market}</td>
+                      <td className="px-3 py-2">{editing ? <input className="w-36 rounded-md border bg-background px-2 py-1" value={instrumentDraft.tags || ""} onChange={(e) => setInstrumentDraft({ ...instrumentDraft, tags: e.target.value })} /> : (item.tags?.join(", ") || "-")}</td>
+                      <td className="max-w-[320px] px-3 py-2 text-muted-foreground">{editing ? <input className="w-full rounded-md border bg-background px-2 py-1" value={instrumentDraft.thesis || ""} onChange={(e) => setInstrumentDraft({ ...instrumentDraft, thesis: e.target.value })} /> : <span className="line-clamp-2" title={item.thesis || undefined}>{item.thesis || "-"}</span>}</td>
+                      <td className="px-3 py-2">
+                        <div className="flex justify-end gap-1">
+                          {editing ? (
+                            <>
+                              <button onClick={() => saveInstrument(item.id)} className="rounded-md border p-1.5 hover:bg-muted" title="保存"><Save className="h-4 w-4" /></button>
+                              <button onClick={() => setEditingInstrumentId(null)} className="rounded-md border p-1.5 hover:bg-muted" title="取消"><X className="h-4 w-4" /></button>
+                            </>
+                          ) : (
+                            <>
+                              <button onClick={() => startEditInstrument(item)} className="rounded-md border p-1.5 hover:bg-muted" title="编辑"><Pencil className="h-4 w-4" /></button>
+                              <button onClick={() => deleteInstrument(item.id)} className="rounded-md border p-1.5 text-danger hover:bg-danger/10" title="删除"><Trash2 className="h-4 w-4" /></button>
+                            </>
+                          )}
+                        </div>
+                      </td>
                     </tr>
-                  )) : <EmptyRow colSpan={5} text={loading ? "加载中..." : "暂无标的"} />}
+                  )}) : <EmptyRow colSpan={6} text={loading ? "加载中..." : "暂无标的"} />}
                 </tbody>
               </table>
             </div>
@@ -451,33 +703,6 @@ export function InvestmentWorkspace() {
                 <div className="p-10 text-center text-sm text-muted-foreground">上传券商持仓截图后，会在这里显示可编辑的识别结果和完整性检查。</div>
               )}
             </div>
-          </div>
-        </section>
-
-        <section className="rounded-md border bg-card">
-          <div className="flex items-center gap-2 border-b px-4 py-3">
-            <ClipboardList className="h-4 w-4 text-primary" />
-            <h2 className="text-sm font-semibold">当前持仓</h2>
-          </div>
-          <div className="overflow-auto">
-            <table className="w-full text-sm">
-              <thead className="bg-muted/50 text-xs text-muted-foreground">
-                <tr><th className="px-3 py-2 text-left">标的</th><th className="px-3 py-2 text-right">数量</th><th className="px-3 py-2 text-right">均价</th><th className="px-3 py-2 text-right">成本</th><th className="px-3 py-2 text-right">市值</th><th className="px-3 py-2 text-right">盈亏</th><th className="px-3 py-2 text-left">备注</th></tr>
-              </thead>
-              <tbody>
-                {positions.length ? positions.map((item) => (
-                  <tr key={item.id} className="border-t">
-                    <td className="px-3 py-2 font-medium">{item.instrument?.symbol ?? item.instrument_id}</td>
-                    <td className="px-3 py-2 text-right">{money(item.quantity)}</td>
-                    <td className="px-3 py-2 text-right">{money(item.avg_cost)}</td>
-                    <td className="px-3 py-2 text-right">{money(item.cost_basis)}</td>
-                    <td className="px-3 py-2 text-right">{money(item.market_value)}</td>
-                    <td className={cn("px-3 py-2 text-right", item.unrealized_pnl >= 0 ? "text-success" : "text-danger")}>{money(item.unrealized_pnl)} · {pctFmt.format(item.unrealized_pnl_pct || 0)}</td>
-                    <td className="max-w-[280px] truncate px-3 py-2 text-muted-foreground">{item.notes || "-"}</td>
-                  </tr>
-                )) : <EmptyRow colSpan={7} text={loading ? "加载中..." : "暂无持仓"} />}
-              </tbody>
-            </table>
           </div>
         </section>
 

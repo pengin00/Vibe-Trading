@@ -194,6 +194,15 @@ def update_position(session, position_id: str, payload) -> m.Position | None:
     return get_position(session, position.id)
 
 
+def delete_position(session, position_id: str) -> bool:
+    position = get_position(session, position_id)
+    if not position:
+        return False
+    session.delete(position)
+    session.flush()
+    return True
+
+
 def add_position_lot(session, payload) -> tuple[m.PositionLot, m.Position]:
     data = _values(payload)
     if data.get("trade_date") is None:

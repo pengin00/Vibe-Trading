@@ -44,6 +44,26 @@ AGENT_DIR = Path(__file__).resolve().parent
 if str(AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_DIR))
 
+
+def _ensure_mcp_environment() -> None:
+    """Load local .env and provide local portfolio DB defaults for MCP entrypoints."""
+    try:
+        from src.providers.llm import _ensure_dotenv
+
+        _ensure_dotenv()
+    except Exception:  # noqa: BLE001 - MCP should still expose non-LLM tools
+        pass
+    if not os.getenv("DATABASE_URL") and not os.getenv("VIBE_DATABASE_URL"):
+        host = os.getenv("POSTGRES_HOST", "127.0.0.1")
+        port = os.getenv("POSTGRES_PORT", "5432")
+        db = os.getenv("POSTGRES_DB", "vibe_trading")
+        user = os.getenv("POSTGRES_USER", "vibe")
+        password = os.getenv("POSTGRES_PASSWORD", "vibe_dev_password")
+        os.environ["DATABASE_URL"] = f"postgresql+psycopg://{user}:{password}@{host}:{port}/{db}"
+
+
+_ensure_mcp_environment()
+
 from fastmcp import Context, FastMCP
 from src.market_data import (
     DEFAULT_MAX_ROWS,

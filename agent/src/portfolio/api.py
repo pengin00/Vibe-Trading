@@ -134,6 +134,13 @@ def update_position(position_id: str, payload: s.PositionUpdate, session=Depends
     return {**p.__dict__, **service.position_metrics(session, p)}
 
 
+@router.delete("/positions/{position_id}")
+def delete_position(position_id: str, session=Depends(db_session)):
+    if not service.delete_position(session, position_id):
+        raise HTTPException(status_code=404, detail="Position not found")
+    return {"status": "ok"}
+
+
 @router.post("/position-lots", response_model=s.PositionLotOut, status_code=201)
 def add_position_lot(payload: s.PositionLotCreate, session=Depends(db_session)):
     lot, _ = service.add_position_lot(session, payload)

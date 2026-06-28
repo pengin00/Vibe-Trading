@@ -326,12 +326,24 @@ export const api = {
     listInstruments: () => request<PortfolioInstrument[]>("/portfolio/instruments?active=true"),
     createInstrument: (body: Partial<PortfolioInstrument> & { symbol: string; name: string }) =>
       request<PortfolioInstrument>("/portfolio/instruments", { method: "POST", body: JSON.stringify(body) }),
+    updateInstrument: (id: string, body: Partial<PortfolioInstrument>) =>
+      request<PortfolioInstrument>(`/portfolio/instruments/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+    deleteInstrument: (id: string) =>
+      request<{ status: string }>(`/portfolio/instruments/${id}`, { method: "DELETE" }),
     listWatchlist: () => request<PortfolioWatchlistItem[]>("/portfolio/watchlist"),
     createWatchlistItem: (body: { instrument_id: string; priority?: number; status?: string; notes?: string }) =>
       request<PortfolioWatchlistItem>("/portfolio/watchlist", { method: "POST", body: JSON.stringify(body) }),
+    updateWatchlistItem: (id: string, body: Partial<PortfolioWatchlistItem>) =>
+      request<PortfolioWatchlistItem>(`/portfolio/watchlist/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+    deleteWatchlistItem: (id: string) =>
+      request<{ status: string }>(`/portfolio/watchlist/${id}`, { method: "DELETE" }),
     listPositions: () => request<PortfolioPosition[]>("/portfolio/positions"),
     createPosition: (body: { instrument_id: string; quantity: number; avg_cost: number; target_weight?: number | null; notes?: string }) =>
       request<PortfolioPosition>("/portfolio/positions", { method: "POST", body: JSON.stringify(body) }),
+    updatePosition: (id: string, body: Partial<PortfolioPosition>) =>
+      request<PortfolioPosition>(`/portfolio/positions/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+    deletePosition: (id: string) =>
+      request<{ status: string }>(`/portfolio/positions/${id}`, { method: "DELETE" }),
     listResearchReports: () => request<PortfolioResearchReport[]>("/portfolio/research-reports?limit=10"),
     listDecisions: () => request<PortfolioDecision[]>("/portfolio/decisions?limit=10"),
     createDecision: (body: { instrument_id?: string | null; decision_type: string; title: string; rationale: string; expected_outcome?: string }) =>
