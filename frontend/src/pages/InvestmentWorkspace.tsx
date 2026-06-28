@@ -526,7 +526,7 @@ export function InvestmentWorkspace() {
           <section className="rounded-md border bg-card">
             <div className="flex items-center gap-2 border-b px-4 py-3">
               <Target className="h-4 w-4 text-primary" />
-              <h2 className="text-sm font-semibold">投资标的与关注列表</h2>
+              <h2 className="text-sm font-semibold">投资标的</h2>
             </div>
             <div className="grid gap-3 border-b p-4 md:grid-cols-6">
               <input className="rounded-md border bg-background px-3 py-2 text-sm md:col-span-1" placeholder="代码" value={instrumentForm.symbol} onChange={(e) => setInstrumentForm({ ...instrumentForm, symbol: e.target.value })} />
