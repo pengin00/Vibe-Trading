@@ -128,6 +128,24 @@ export function buildSwarmStatusFromStarted(data: AnyRecord, now = Date.now()): 
   };
 }
 
+export function buildSwarmStatusFromRunDetail(data: AnyRecord, now = Date.now()): SwarmRunStatus | null {
+  const createdAt = timestampMs(data.created_at, now);
+  const completedAt = timestampMs(data.completed_at, 0) || undefined;
+  const status = buildSwarmStatusFromStarted(
+    {
+      ...data,
+      run_id: asString(data.run_id) || asString(data.id),
+      preset: asString(data.preset) || asString(data.preset_name),
+    },
+    createdAt,
+  );
+  if (!status) return null;
+  return {
+    ...status,
+    completedAt,
+  };
+}
+
 export function applySwarmEvent(current: SwarmRunStatus, rawEvent: unknown, now = Date.now()): SwarmRunStatus {
   const event = asRecord(rawEvent);
   const data = asRecord(event.data);

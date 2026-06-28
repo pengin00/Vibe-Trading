@@ -20,6 +20,7 @@ import { SwarmStatusCard } from "@/components/chat/SwarmStatusCard";
 import { ToolTracePanel } from "@/components/chat/ToolTracePanel";
 import {
   applySwarmEvent,
+  buildSwarmStatusFromRunDetail,
   buildSwarmStatusFromStarted,
   buildSwarmStatusFromToolResultPreview,
 } from "@/lib/swarmStatus";
@@ -52,6 +53,28 @@ const act = () => useAgentStore.getState();
 
 /** Poll cadence for the shared `GET /live/status` snapshot. */
 const LIVE_STATUS_POLL_INTERVAL_MS = 15_000;
+const ACTIVE_SWARM_STATUSES = new Set(["pending", "running"]);
+const SWARM_EVENT_TYPES = [
+  "run_started",
+  "run_completed",
+  "run_error",
+  "layer_started",
+  "task_started",
+  "worker_started",
+  "tool_call",
+  "tool_result",
+  "task_heartbeat",
+  "worker_text",
+  "task_completed",
+  "worker_completed",
+  "task_failed",
+  "worker_failed",
+  "worker_timeout",
+  "worker_incomplete",
+  "task_blocked",
+  "task_retry",
+  "done",
+];
 const CONNECTOR_CHECK_PROMPT =
   "List my trading connector profiles, show which one is selected, then check that selected connector. If it is not ready, tell me exactly what setup step is missing. Do not place or modify orders.";
 const CONNECTOR_PORTFOLIO_PROMPT =
@@ -219,6 +242,7 @@ export function Agent() {
   const isComposingRef = useRef(false);
   const lastCompositionEndRef = useRef(0);
   const sseSessionRef = useRef<string | null>(null);
+  const swarmSourcesRef = useRef<Map<string, EventSource>>(new Map());
   const prevSseStatusRef = useRef<string>("disconnected");
   const genRef = useRef(0);
   const pendingGoalSessionRef = useRef<string | null>(null);
@@ -325,6 +349,83 @@ export function Agent() {
     sseSessionRef.current = null;
   }, [disconnect]);
 
+  const disconnectSwarmSource = useCallback((runId: string) => {
+    const source = swarmSourcesRef.current.get(runId);
+    if (!source) return;
+    source.close();
+    swarmSourcesRef.current.delete(runId);
+  }, []);
+
+  const disconnectAllSwarmSources = useCallback(() => {
+    for (const source of swarmSourcesRef.current.values()) {
+      source.close();
+    }
+    swarmSourcesRef.current.clear();
+  }, []);
+
+  const connectSwarmRunEvents = useCallback((runId: string) => {
+    if (!runId || swarmSourcesRef.current.has(runId)) return;
+    const source = new EventSource(api.swarmSseUrl(runId));
+    swarmSourcesRef.current.set(runId, source);
+
+    const handleEvent = (raw: MessageEvent) => {
+      let event: unknown;
+      try {
+        event = JSON.parse(raw.data);
+      } catch {
+        event = { type: raw.type, data: { raw: raw.data } };
+      }
+      act().updateSwarmStatus(runId, (current) => applySwarmEvent(current, event));
+      scrollToBottom();
+    };
+
+    for (const eventType of SWARM_EVENT_TYPES) {
+      source.addEventListener(eventType, (event) => {
+        if (eventType === "done") {
+          disconnectSwarmSource(runId);
+          try {
+            const data = JSON.parse((event as MessageEvent).data) as { status?: string };
+            const status = data.status;
+            if (status === "completed" || status === "failed" || status === "cancelled") {
+              act().updateSwarmStatus(runId, (current) => ({
+                ...current,
+                status,
+                completedAt: Date.now(),
+              }));
+            }
+          } catch {
+            // The preceding terminal run event already carries the detailed state.
+          }
+          return;
+        }
+        handleEvent(event as MessageEvent);
+      });
+    }
+
+    source.onerror = () => {
+      disconnectSwarmSource(runId);
+    };
+  }, [disconnectSwarmSource, scrollToBottom]);
+
+  const hydrateActiveSwarmRuns = useCallback(async () => {
+    try {
+      const runs = await api.listSwarmRuns();
+      const active = runs.filter((run) => ACTIVE_SWARM_STATUSES.has(run.status));
+      for (const run of active) {
+        const detail = await api.getSwarmRun(run.id);
+        const status = buildSwarmStatusFromRunDetail(detail);
+        if (!status || !ACTIVE_SWARM_STATUSES.has(status.status)) continue;
+        act().upsertSwarmStatus(status);
+        connectSwarmRunEvents(status.runId);
+      }
+      if (active.length > 0 && act().status !== "streaming") {
+        act().setStatus("streaming");
+      }
+    } catch {
+      // Swarm is optional on some deployments; session history and SSE still work.
+    }
+  }, [connectSwarmRunEvents]);
+
   const loadGoalSnapshot = useCallback(async (sid?: string | null) => {
     const targetSession = sid || act().sessionId;
     if (!targetSession) {
@@ -405,11 +506,12 @@ export function Agent() {
       act().loadHistory(agentMsgs);
       act().setSessionLoading(false);
       act().cacheSession(sid, agentMsgs);
+      void hydrateActiveSwarmRuns();
       setTimeout(() => forceScrollToBottom(), 50);
     } catch {
       act().setSessionLoading(false);
     }
-  }, [forceScrollToBottom]);
+  }, [forceScrollToBottom, hydrateActiveSwarmRuns]);
 
   const refreshSessionMessages = useCallback(async (sid: string) => {
     const gen = genRef.current + 1;
@@ -656,6 +758,7 @@ export function Agent() {
         const status = buildSwarmStatusFromStarted(d);
         if (!status) return;
         act().upsertSwarmStatus(status);
+        connectSwarmRunEvents(status.runId);
         scrollToBottom();
       },
 
@@ -747,7 +850,7 @@ export function Agent() {
       heartbeat: () => {},
       reconnect: (d) => { act().setSseStatus("reconnecting", Number(d.attempt ?? 0)); },
     });
-  }, [connect, disconnect, loadGoalSnapshot, scrollToBottom]);
+  }, [connect, connectSwarmRunEvents, disconnect, loadGoalSnapshot, scrollToBottom]);
 
   useEffect(() => {
     const { sessionId: curSid, messages: curMsgs, cacheSession, reset, getCachedSession, switchSession } = act();
@@ -768,6 +871,7 @@ export function Agent() {
       const cached = getCachedSession(urlSessionId);
       switchSession(urlSessionId, cached);
       if (cached) {
+        void hydrateActiveSwarmRuns();
         setTimeout(() => forceScrollToBottom(), 50);
       } else {
         loadSessionMessages(urlSessionId, gen);
@@ -801,7 +905,7 @@ export function Agent() {
       if (curSid && curMsgs.length > 0) cacheSession(curSid, curMsgs);
       reset();
     }
-  }, [urlSessionId, doDisconnect, loadSessionMessages, refreshSessionTrace, setupSSE, forceScrollToBottom]);
+  }, [urlSessionId, doDisconnect, hydrateActiveSwarmRuns, loadSessionMessages, refreshSessionTrace, setupSSE, forceScrollToBottom]);
 
   /* Single shared poller for `GET /live/status`. RunnerStatus consumes this snapshot
    * as a prop rather than polling independently, and the global kill switch reads it
@@ -848,7 +952,10 @@ export function Agent() {
     loadGoalSnapshot(sessionId);
   }, [sessionId, loadGoalSnapshot]);
 
-  useEffect(() => () => doDisconnect(), [doDisconnect]);
+  useEffect(() => () => {
+    doDisconnect();
+    disconnectAllSwarmSources();
+  }, [disconnectAllSwarmSources, doDisconnect]);
 
   useEffect(() => {
     api.getLLMSettings().then((s) => {

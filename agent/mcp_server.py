@@ -1949,6 +1949,521 @@ def scan_shadow_signals(
 
 
 # ---------------------------------------------------------------------------
+# Investment Workspace / Portfolio MCP tools
+# ---------------------------------------------------------------------------
+
+PORTFOLIO_ENTITIES = {
+    "account": "PortfolioAccount",
+    "instrument": "Instrument",
+    "watchlist": "WatchlistItem",
+    "position": "Position",
+    "lot": "PositionLot",
+    "price": "PriceSnapshot",
+    "research": "ResearchReport",
+    "rule": "TrackingRule",
+    "rule_event": "RuleTriggerEvent",
+    "decision": "DecisionLog",
+    "import_job": "PositionImportJob",
+    "import_item": "PositionImportItem",
+}
+
+
+def _portfolio_session_scope():
+    from src.portfolio.db import session_scope
+
+    return session_scope()
+
+
+def _portfolio_model(entity: str):
+    from src.portfolio import models as pm
+
+    key = entity.strip().lower()
+    if key not in PORTFOLIO_ENTITIES:
+        raise ValueError(f"unsupported portfolio entity: {entity}; allowed: {', '.join(sorted(PORTFOLIO_ENTITIES))}")
+    return getattr(pm, PORTFOLIO_ENTITIES[key])
+
+
+def _portfolio_dump(value: Any) -> Any:
+    from datetime import date, datetime
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_portfolio_dump(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _portfolio_dump(item) for key, item in value.items() if not str(key).startswith("_sa_")}
+    if hasattr(value, "__table__"):
+        data = {column.name: _portfolio_dump(getattr(value, column.name)) for column in value.__table__.columns}
+        for rel in getattr(value, "__mapper__").relationships:
+            if rel.key in value.__dict__:
+                data[rel.key] = _portfolio_dump(getattr(value, rel.key))
+        return data
+    return str(value)
+
+
+def _portfolio_parse_datetime(value: Any):
+    from datetime import datetime
+
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return value
+
+
+def _portfolio_clean_data(model: Any, data: dict[str, Any], *, partial: bool = False) -> dict[str, Any]:
+    columns = {column.name: column for column in model.__table__.columns}
+    blocked = {"id", "created_at", "updated_at"}
+    cleaned: dict[str, Any] = {}
+    for key, value in (data or {}).items():
+        if key in blocked or key not in columns:
+            continue
+        column = columns[key]
+        if column.type.__class__.__name__ == "DateTime":
+            value = _portfolio_parse_datetime(value)
+        cleaned[key] = value
+    if not partial and model.__name__ == "Instrument":
+        if "symbol" in cleaned and isinstance(cleaned["symbol"], str):
+            cleaned["symbol"] = cleaned["symbol"].upper()
+        if "market" in cleaned and isinstance(cleaned["market"], str):
+            cleaned["market"] = cleaned["market"].upper()
+    return cleaned
+
+
+@mcp.tool
+def portfolio_health() -> str:
+    """Check whether the Investment Workspace database is reachable.
+
+    Returns database connection status for PostgreSQL-backed portfolio data.
+    """
+    try:
+        with _portfolio_session_scope():
+            pass
+        return _json_ok(database="connected")
+    except Exception as exc:
+        return _json_error(str(exc), error_type="database")
+
+
+@mcp.tool
+def portfolio_dashboard() -> str:
+    """Return Investment Workspace dashboard totals and recent reports."""
+    try:
+        from src.portfolio import service as ps
+
+        with _portfolio_session_scope() as session:
+            return _json_ok(dashboard=_portfolio_dump(ps.dashboard(session)))
+    except Exception as exc:
+        return _json_error(str(exc), error_type="portfolio")
+
+
+@mcp.tool
+def portfolio_list_records(entity: str, limit: int = 100, filters: dict[str, Any] | None = None) -> str:
+    """List Investment Workspace records for any supported entity.
+
+    Args:
+        entity: One of account, instrument, watchlist, position, lot, price,
+            research, rule, rule_event, decision, import_job, import_item.
+        limit: Maximum records to return, capped at 500.
+        filters: Exact-match filters by column name, e.g. {"symbol": "AAPL"}.
+    """
+    try:
+        from sqlalchemy import select
+        from sqlalchemy.orm import joinedload
+
+        model = _portfolio_model(entity)
+        limit = max(1, min(int(limit), 500))
+        with _portfolio_session_scope() as session:
+            stmt = select(model).limit(limit)
+            for key, value in (filters or {}).items():
+                if hasattr(model, key):
+                    stmt = stmt.where(getattr(model, key) == value)
+            if entity.strip().lower() == "position":
+                from src.portfolio import models as pm
+
+                stmt = stmt.options(joinedload(pm.Position.instrument), joinedload(pm.Position.account))
+            records = list(session.execute(stmt).unique().scalars())
+            if entity.strip().lower() == "position":
+                from src.portfolio import service as ps
+
+                data = [{**_portfolio_dump(record), **ps.position_metrics(session, record)} for record in records]
+            else:
+                data = _portfolio_dump(records)
+            return _json_ok(entity=entity, count=len(records), records=data)
+    except Exception as exc:
+        return _json_error(str(exc), error_type="portfolio")
+
+
+@mcp.tool
+def portfolio_get_record(entity: str, record_id: str) -> str:
+    """Get one Investment Workspace record by entity and id."""
+    try:
+        model = _portfolio_model(entity)
+        with _portfolio_session_scope() as session:
+            record = session.get(model, record_id)
+            if record is None:
+                return _json_error("record not found", error_type="not_found")
+            return _json_ok(entity=entity, record=_portfolio_dump(record))
+    except Exception as exc:
+        return _json_error(str(exc), error_type="portfolio")
+
+
+@mcp.tool
+def portfolio_create_record(entity: str, data: dict[str, Any]) -> str:
+    """Create one Investment Workspace record for any supported entity.
+
+    Args:
+        entity: Supported portfolio entity name.
+        data: Column data. id/created_at/updated_at are ignored.
+    """
+    try:
+        from src.portfolio import service as ps
+        from src.portfolio import schemas as psc
+
+        entity_key = entity.strip().lower()
+        with _portfolio_session_scope() as session:
+            if entity_key == "position":
+                record = ps.create_position(session, psc.PositionCreate(**data))
+            elif entity_key == "lot":
+                record, _ = ps.add_position_lot(session, psc.PositionLotCreate(**data))
+            elif entity_key == "price":
+                record = ps.add_price_snapshot(session, psc.PriceSnapshotCreate(**data))
+            else:
+                model = _portfolio_model(entity_key)
+                record = model(**_portfolio_clean_data(model, data))
+                session.add(record)
+                session.flush()
+            return _json_ok(entity=entity_key, record=_portfolio_dump(record))
+    except Exception as exc:
+        return _json_error(str(exc), error_type="portfolio")
+
+
+@mcp.tool
+def portfolio_update_record(entity: str, record_id: str, data: dict[str, Any]) -> str:
+    """Update one Investment Workspace record by entity and id.
+
+    Args:
+        entity: Supported portfolio entity name.
+        record_id: Record id.
+        data: Partial column data. id/created_at/updated_at are ignored.
+    """
+    try:
+        model = _portfolio_model(entity)
+        with _portfolio_session_scope() as session:
+            record = session.get(model, record_id)
+            if record is None:
+                return _json_error("record not found", error_type="not_found")
+            for key, value in _portfolio_clean_data(model, data, partial=True).items():
+                setattr(record, key, value)
+            session.flush()
+            return _json_ok(entity=entity, record=_portfolio_dump(record))
+    except Exception as exc:
+        return _json_error(str(exc), error_type="portfolio")
+
+
+@mcp.tool
+def portfolio_delete_record(entity: str, record_id: str, soft_delete: bool = True) -> str:
+    """Delete or archive one Investment Workspace record.
+
+    For instruments and accounts, soft_delete=true marks is_active=false when
+    that column exists. Other records are physically deleted.
+    """
+    try:
+        model = _portfolio_model(entity)
+        with _portfolio_session_scope() as session:
+            record = session.get(model, record_id)
+            if record is None:
+                return _json_error("record not found", error_type="not_found")
+            if soft_delete and hasattr(record, "is_active"):
+                record.is_active = False
+            else:
+                session.delete(record)
+            session.flush()
+            return _json_ok(entity=entity, id=record_id)
+    except Exception as exc:
+        return _json_error(str(exc), error_type="portfolio")
+
+
+@mcp.tool
+def portfolio_upsert_instrument(
+    symbol: str,
+    name: str,
+    market: str = "US",
+    asset_class: str = "equity",
+    currency: str = "USD",
+    sector: str = "",
+    region: str = "",
+    tags: list[str] | None = None,
+    thesis: str = "",
+    data_source: str = "",
+) -> str:
+    """Create or update an investment instrument tracked by the workspace."""
+    try:
+        from src.portfolio import service as ps
+        from src.portfolio import schemas as psc
+
+        with _portfolio_session_scope() as session:
+            instrument = ps.find_instrument(session, symbol, market)
+            payload = {
+                "symbol": symbol,
+                "name": name,
+                "market": market,
+                "asset_class": asset_class,
+                "currency": currency,
+                "sector": _blank_to_none(sector),
+                "region": _blank_to_none(region),
+                "tags": tags or [],
+                "thesis": _blank_to_none(thesis),
+                "data_source": _blank_to_none(data_source),
+            }
+            if instrument:
+                instrument = ps.update_instrument(session, instrument.id, psc.InstrumentUpdate(**payload))
+                action = "updated"
+            else:
+                instrument = ps.create_instrument(session, psc.InstrumentCreate(**payload))
+                action = "created"
+            return _json_ok(action=action, instrument=_portfolio_dump(instrument))
+    except Exception as exc:
+        return _json_error(str(exc), error_type="portfolio")
+
+
+@mcp.tool
+def portfolio_upsert_position(
+    symbol: str,
+    name: str,
+    quantity: float,
+    avg_cost: float,
+    market: str = "US",
+    asset_class: str = "equity",
+    currency: str = "USD",
+    account_name: str = "Default Manual Account",
+    broker: str = "manual",
+    target_weight: float | None = None,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
+    notes: str = "",
+) -> str:
+    """Create or update a holding position by symbol/account."""
+    try:
+        from sqlalchemy import select
+        from src.portfolio import models as pm
+        from src.portfolio import service as ps
+        from src.portfolio import schemas as psc
+
+        with _portfolio_session_scope() as session:
+            instrument = ps.find_instrument(session, symbol, market)
+            if not instrument:
+                instrument = ps.create_instrument(
+                    session,
+                    psc.InstrumentCreate(symbol=symbol, name=name, market=market, asset_class=asset_class, currency=currency),
+                )
+            account = session.execute(select(pm.PortfolioAccount).where(pm.PortfolioAccount.name == account_name).limit(1)).scalar_one_or_none()
+            if not account:
+                account = pm.PortfolioAccount(name=account_name, broker=broker, account_type="manual", base_currency=currency)
+                session.add(account)
+                session.flush()
+            position = session.execute(
+                select(pm.Position).where(pm.Position.account_id == account.id, pm.Position.instrument_id == instrument.id).limit(1)
+            ).scalar_one_or_none()
+            payload = {
+                "quantity": quantity,
+                "avg_cost": avg_cost,
+                "cost_basis": quantity * avg_cost,
+                "target_weight": target_weight,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "notes": _blank_to_none(notes),
+            }
+            if position:
+                position = ps.update_position(session, position.id, psc.PositionUpdate(**payload))
+                action = "updated"
+            else:
+                position = ps.create_position(session, psc.PositionCreate(account_id=account.id, instrument_id=instrument.id, **payload))
+                action = "created"
+            return _json_ok(action=action, position={**_portfolio_dump(position), **ps.position_metrics(session, position)})
+    except Exception as exc:
+        return _json_error(str(exc), error_type="portfolio")
+
+
+@mcp.tool
+def portfolio_add_research_report(
+    title: str,
+    symbol: str = "",
+    market: str = "US",
+    report_type: str = "research",
+    summary: str = "",
+    content: str = "",
+    content_path: str = "",
+    rating: str = "",
+    confidence: float | None = None,
+    evidence: list[dict[str, Any]] | None = None,
+    generated_by: str = "mcp",
+) -> str:
+    """Save an investment research report into the workspace."""
+    try:
+        from src.portfolio import service as ps
+        from src.portfolio import schemas as psc
+
+        with _portfolio_session_scope() as session:
+            instrument_id = None
+            if symbol:
+                instrument = ps.find_instrument(session, symbol, market)
+                instrument_id = instrument.id if instrument else None
+            report = ps.create_research_report(
+                session,
+                psc.ResearchReportCreate(
+                    instrument_id=instrument_id,
+                    title=title,
+                    report_type=report_type,
+                    summary=_blank_to_none(summary),
+                    content=_blank_to_none(content),
+                    content_path=_blank_to_none(content_path),
+                    rating=_blank_to_none(rating),
+                    confidence=confidence,
+                    evidence=evidence or [],
+                    generated_by=generated_by,
+                ),
+            )
+            return _json_ok(report=_portfolio_dump(report))
+    except Exception as exc:
+        return _json_error(str(exc), error_type="portfolio")
+
+
+@mcp.tool
+def portfolio_record_decision(
+    decision_type: str,
+    title: str,
+    rationale: str,
+    symbol: str = "",
+    market: str = "US",
+    expected_outcome: str = "",
+    review_date: str = "",
+    linked_report_id: str = "",
+) -> str:
+    """Record an investment decision such as buy/sell/hold/watch/rebalance."""
+    try:
+        from src.portfolio import service as ps
+        from src.portfolio import schemas as psc
+
+        with _portfolio_session_scope() as session:
+            instrument_id = None
+            if symbol:
+                instrument = ps.find_instrument(session, symbol, market)
+                instrument_id = instrument.id if instrument else None
+            decision = ps.create_decision(
+                session,
+                psc.DecisionLogCreate(
+                    instrument_id=instrument_id,
+                    decision_type=decision_type,
+                    title=title,
+                    rationale=rationale,
+                    expected_outcome=_blank_to_none(expected_outcome),
+                    review_date=_portfolio_parse_datetime(review_date) if review_date else None,
+                    linked_report_id=_blank_to_none(linked_report_id),
+                ),
+            )
+            return _json_ok(decision=_portfolio_dump(decision))
+    except Exception as exc:
+        return _json_error(str(exc), error_type="portfolio")
+
+
+@mcp.tool
+def portfolio_upload_position_screenshot(
+    image_path: str = "",
+    image_base64: str = "",
+    filename: str = "position_screenshot.png",
+    content_type: str = "image/png",
+) -> str:
+    """Upload a holdings screenshot and create a reviewable import job.
+
+    Provide either image_path or image_base64. Parsed rows must still pass
+    completeness checks before portfolio_confirm_import can save them.
+    """
+    try:
+        import base64
+
+        from src.portfolio import import_service as pis
+
+        if image_path:
+            path = Path(image_path).expanduser()
+            content = path.read_bytes()
+            filename = path.name
+        elif image_base64:
+            content = base64.b64decode(image_base64)
+        else:
+            raise ValueError("image_path or image_base64 is required")
+        with _portfolio_session_scope() as session:
+            job = pis.create_import_job(session, filename=filename, content=content, content_type=content_type)
+            return _json_ok(import_job=pis.import_job_payload(session, job))
+    except Exception as exc:
+        return _json_error(str(exc), error_type="portfolio_import")
+
+
+@mcp.tool
+def portfolio_update_import_job(job_id: str, broker: str = "", account_name: str = "", summary: str = "", items: list[dict[str, Any]] | None = None) -> str:
+    """Patch a holdings screenshot import job after human review.
+
+    Args:
+        job_id: Import job id.
+        broker: Optional broker/source.
+        account_name: Optional account name.
+        summary: Optional review summary.
+        items: Optional ordered list of corrected import item fields.
+    """
+    try:
+        from src.portfolio import import_service as pis
+        from src.portfolio import schemas as psc
+
+        payload = psc.PositionImportJobPatch(
+            broker=_blank_to_none(broker),
+            account_name=_blank_to_none(account_name),
+            summary=_blank_to_none(summary),
+            items=[psc.PositionImportItemPatch(**item) for item in (items or [])] if items is not None else None,
+        )
+        with _portfolio_session_scope() as session:
+            job = pis.patch_import_job(session, job_id, payload)
+            return _json_ok(import_job=pis.import_job_payload(session, job))
+    except Exception as exc:
+        return _json_error(str(exc), error_type="portfolio_import")
+
+
+@mcp.tool
+def portfolio_confirm_import(
+    job_id: str,
+    account_name: str = "",
+    broker: str = "",
+    overwrite_existing: bool = True,
+    save_price_snapshots: bool = True,
+) -> str:
+    """Confirm a reviewed screenshot import job and save positions to the workspace."""
+    try:
+        from src.portfolio import import_service as pis
+        from src.portfolio import schemas as psc
+
+        with _portfolio_session_scope() as session:
+            result = pis.confirm_import_job(
+                session,
+                job_id,
+                psc.PositionImportConfirmRequest(
+                    account_name=_blank_to_none(account_name),
+                    broker=_blank_to_none(broker),
+                    overwrite_existing=overwrite_existing,
+                    save_price_snapshots=save_price_snapshots,
+                ),
+            )
+            return _json_ok(**result)
+    except Exception as exc:
+        return _json_error(str(exc), error_type="portfolio_import")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

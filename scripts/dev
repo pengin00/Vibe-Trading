@@ -159,7 +159,13 @@ start_backend() {
     printf "backend already reachable at %s (external)\n" "$(service_url backend)"
     return
   fi
-  start_service backend env PYTHONPATH="$ROOT/agent" "$PYTHON_BIN" -c 'import cli, sys; raise SystemExit(cli.main(sys.argv[1:]))' serve \
+  # Local dev default: point the investment workspace at the host-local
+  # Postgres container (Docker Compose does the same for its in-network
+  # `postgres` service). Honor explicit exports first so users can still
+  # override when needed. Note: host must be 127.0.0.1 here, not `postgres`,
+  # because the backend is not running inside the compose network.
+  local db_url="${DATABASE_URL:-${VIBE_DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-vibe}:${POSTGRES_PASSWORD:-vibe_dev_password}@127.0.0.1:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-vibe_trading}}}"
+  start_service backend env PYTHONPATH="$ROOT/agent" DATABASE_URL="$db_url" "$PYTHON_BIN" -c 'import cli, sys; raise SystemExit(cli.main(sys.argv[1:]))' serve \
     --host "$BACKEND_HOST" \
     --port "$BACKEND_PORT"
 }

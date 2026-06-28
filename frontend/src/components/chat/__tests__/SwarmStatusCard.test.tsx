@@ -4,6 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { SwarmStatusCard } from "../SwarmStatusCard";
 import {
   applySwarmEvent,
+  buildSwarmStatusFromRunDetail,
   buildSwarmStatusFromStarted,
   buildSwarmStatusFromToolResultPreview,
 } from "@/lib/swarmStatus";
@@ -65,6 +66,32 @@ describe("SwarmStatusCard", () => {
       taskId: "t1",
       role: "Analyst",
       status: "waiting",
+    });
+  });
+
+  it("builds a card model from a persisted run detail snapshot", () => {
+    const status = buildSwarmStatusFromRunDetail({
+      id: "r-snapshot",
+      preset_name: "research_team",
+      status: "running",
+      created_at: "2026-06-07T12:00:00Z",
+      agents: [{ id: "risk", role: "Risk" }],
+      tasks: [{ id: "risk_review", agent_id: "risk", status: "in_progress", worker_iterations: 2, summary: "reviewing limits" }],
+    });
+
+    expect(status).toMatchObject({
+      runId: "r-snapshot",
+      preset: "research_team",
+      status: "running",
+      startedAt: new Date("2026-06-07T12:00:00Z").getTime(),
+      agents: [{
+        agentId: "risk",
+        taskId: "risk_review",
+        role: "Risk",
+        status: "running",
+        iterations: 2,
+        lastText: "reviewing limits",
+      }],
     });
   });
 
