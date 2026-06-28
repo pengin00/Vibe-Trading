@@ -321,3 +321,32 @@ class AddTrackingRuleTool(BaseTool):
             return {"id": rule.id, "name": rule.name, "rule_type": rule.rule_type}
 
         return _run(op)
+
+
+class RunPortfolioAutopilotTool(BaseTool):
+    name = "run_portfolio_autopilot"
+    description = "运行一次投资工作台自动研究：优先读取持仓和关注标的，刷新价格，执行跟踪规则，并写入自动研究简报。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "max_targets": {"type": "integer", "description": "最多处理的标的数量，默认 10"},
+            "create_reports": {"type": "boolean", "description": "是否写入自动研究简报，默认 true"},
+            "refresh_prices": {"type": "boolean", "description": "是否尝试刷新价格，默认 true"},
+        },
+        "required": [],
+    }
+    repeatable = True
+    is_readonly = False
+
+    def execute(self, max_targets: int = 10, create_reports: bool = True, refresh_prices: bool = True) -> str:
+        try:
+            from src.portfolio import autopilot
+
+            result = autopilot.run_once(
+                max_targets=max_targets,
+                create_reports=create_reports,
+                price_provider=autopilot.default_price_provider if refresh_prices else None,
+            )
+            return json.dumps({"status": result.status, "data": result.as_dict()}, ensure_ascii=False, default=str)
+        except Exception as exc:
+            return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)

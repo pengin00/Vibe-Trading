@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { BriefcaseBusiness, CheckCircle2, ClipboardList, FileText, ImageUp, LineChart, Loader2, Pencil, Plus, RefreshCw, Save, Target, Trash2, TriangleAlert, X } from "lucide-react";
+import { BriefcaseBusiness, CheckCircle2, ClipboardList, Eye, FileText, ImageUp, LineChart, Loader2, Pencil, Plus, RefreshCw, Save, Target, Trash2, TriangleAlert, X } from "lucide-react";
 import { toast } from "sonner";
-import { api, ApiError, type PortfolioDashboard, type PortfolioDecision, type PortfolioInstrument, type PortfolioPosition, type PortfolioResearchReport, type PortfolioWatchlistItem, type PositionImportItemPatch, type PositionImportJob } from "@/lib/api";
+import { api, ApiError, type PortfolioDashboard, type PortfolioDecision, type PortfolioInstrument, type PortfolioPosition, type PortfolioResearchReport, type PortfolioRuleEventPage, type PortfolioTrackingRule, type PortfolioWatchlistItem, type PositionImportItemPatch, type PositionImportJob } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const numberFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
@@ -9,6 +9,44 @@ const pctFmt = new Intl.NumberFormat(undefined, { style: "percent", maximumFract
 
 function money(value: number | null | undefined) {
   return numberFmt.format(value ?? 0);
+}
+
+function timeText(value: string | null | undefined) {
+  return value ? new Date(value).toLocaleString() : "-";
+}
+
+function compactJson(value: unknown) {
+  try {
+    return JSON.stringify(value ?? {});
+  } catch {
+    return "{}";
+  }
+}
+
+function parseJsonInput(value: string): Record<string, unknown> {
+  if (!value.trim()) return {};
+  const parsed = JSON.parse(value);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("JSON 必须是对象");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function percentInputToWeight(value: string): number | null {
+  if (!value.trim()) return null;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  return num > 1 ? num / 100 : num;
+}
+
+function weightToPercentInput(value: number | null | undefined): string {
+  return value == null ? "" : String(Number((value * 100).toFixed(4)));
+}
+
+function optionalNumberInput(value: string): number | null {
+  if (!value.trim()) return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
 }
 
 function Stat({ label, value, tone }: { label: string; value: string; tone?: "up" | "down" }) {
@@ -38,6 +76,9 @@ export function InvestmentWorkspace() {
   const [positions, setPositions] = useState<PortfolioPosition[]>([]);
   const [reports, setReports] = useState<PortfolioResearchReport[]>([]);
   const [decisions, setDecisions] = useState<PortfolioDecision[]>([]);
+  const [trackingRules, setTrackingRules] = useState<PortfolioTrackingRule[]>([]);
+  const [ruleEvents, setRuleEvents] = useState<PortfolioRuleEventPage | null>(null);
+  const [ruleEventOffset, setRuleEventOffset] = useState(0);
   const [importJobs, setImportJobs] = useState<PositionImportJob[]>([]);
   const [activeImport, setActiveImport] = useState<PositionImportJob | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -50,23 +91,32 @@ export function InvestmentWorkspace() {
   const [instrumentForm, setInstrumentForm] = useState({ symbol: "", name: "", market: "US", asset_class: "equity", currency: "USD", tags: "", thesis: "" });
   const [positionForm, setPositionForm] = useState({ instrument_id: "", quantity: "", avg_cost: "", target_weight: "", notes: "" });
   const [decisionForm, setDecisionForm] = useState({ instrument_id: "", decision_type: "watch", title: "", rationale: "" });
+  const [ruleForm, setRuleForm] = useState({ instrument_id: "", name: "", rule_type: "price", cadence: "daily", condition: "{\"price_above\": 0}", action: "{\"research\": \"quick_update\"}", is_enabled: true });
+  const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
+  const [ruleDraft, setRuleDraft] = useState<Record<string, string>>({});
 
   const selectedInstrument = useMemo(
     () => instruments.find((item) => item.id === positionForm.instrument_id),
     [instruments, positionForm.instrument_id],
+  );
+  const watchlistedInstrumentIds = useMemo(
+    () => new Set(watchlist.map((item) => item.instrument_id)),
+    [watchlist],
   );
 
   const load = async () => {
     setError(null);
     setLoading(true);
     try {
-      const [dash, inst, watch, pos, reps, decs, jobs] = await Promise.all([
+      const [dash, inst, watch, pos, reps, decs, rules, events, jobs] = await Promise.all([
         api.portfolio.dashboard(),
         api.portfolio.listInstruments(),
         api.portfolio.listWatchlist(),
         api.portfolio.listPositions(),
         api.portfolio.listResearchReports(),
         api.portfolio.listDecisions(),
+        api.portfolio.listTrackingRules(),
+        api.portfolio.listRuleEvents(ruleEventOffset, 10),
         api.portfolio.listImports(),
       ]);
       setDashboard(dash);
@@ -75,6 +125,8 @@ export function InvestmentWorkspace() {
       setPositions(pos);
       setReports(reps);
       setDecisions(decs);
+      setTrackingRules(rules);
+      setRuleEvents(events);
       setImportJobs(jobs);
       setActiveImport((prev) => prev ? jobs.find((job) => job.id === prev.id) ?? prev : jobs[0] ?? null);
       if (!positionForm.instrument_id && inst.length) {
@@ -89,6 +141,9 @@ export function InvestmentWorkspace() {
   };
 
   useEffect(() => { load(); }, []);
+  useEffect(() => {
+    api.portfolio.listRuleEvents(ruleEventOffset, 10).then(setRuleEvents).catch(() => undefined);
+  }, [ruleEventOffset]);
 
   const createInstrument = async () => {
     if (!instrumentForm.symbol.trim() || !instrumentForm.name.trim()) return;
@@ -121,7 +176,7 @@ export function InvestmentWorkspace() {
         instrument_id: positionForm.instrument_id,
         quantity: Number(positionForm.quantity),
         avg_cost: Number(positionForm.avg_cost),
-        target_weight: positionForm.target_weight ? Number(positionForm.target_weight) : null,
+        target_weight: percentInputToWeight(positionForm.target_weight),
         notes: positionForm.notes,
       });
       setPositionForm((prev) => ({ ...prev, quantity: "", avg_cost: "", target_weight: "", notes: "" }));
@@ -179,6 +234,20 @@ export function InvestmentWorkspace() {
     }
   };
 
+  const addToWatchlist = async (item: PortfolioInstrument) => {
+    if (watchlistedInstrumentIds.has(item.id)) return;
+    setSaving(true);
+    try {
+      await api.portfolio.createWatchlistItem({ instrument_id: item.id, priority: 3, status: "watching" });
+      toast.success("已加入关注列表");
+      await load();
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "加入关注列表失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const startEditWatchlist = (item: PortfolioWatchlistItem) => {
     setEditingWatchlistId(item.id);
     setWatchlistDraft({
@@ -231,7 +300,7 @@ export function InvestmentWorkspace() {
     setPositionDraft({
       quantity: String(item.quantity ?? ""),
       avg_cost: String(item.avg_cost ?? ""),
-      target_weight: item.target_weight?.toString() || "",
+      target_weight: weightToPercentInput(item.target_weight),
       stop_loss: item.stop_loss?.toString() || "",
       take_profit: item.take_profit?.toString() || "",
       notes: item.notes || "",
@@ -244,7 +313,7 @@ export function InvestmentWorkspace() {
       await api.portfolio.updatePosition(id, {
         quantity: Number(positionDraft.quantity || 0),
         avg_cost: Number(positionDraft.avg_cost || 0),
-        target_weight: positionDraft.target_weight ? Number(positionDraft.target_weight) : null,
+        target_weight: percentInputToWeight(positionDraft.target_weight),
         stop_loss: positionDraft.stop_loss ? Number(positionDraft.stop_loss) : null,
         take_profit: positionDraft.take_profit ? Number(positionDraft.take_profit) : null,
         notes: positionDraft.notes || null,
@@ -288,6 +357,78 @@ export function InvestmentWorkspace() {
       await load();
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : "记录决策失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const createTrackingRule = async () => {
+    if (!ruleForm.name.trim()) return;
+    setSaving(true);
+    try {
+      await api.portfolio.createTrackingRule({
+        instrument_id: ruleForm.instrument_id || null,
+        name: ruleForm.name.trim(),
+        rule_type: ruleForm.rule_type.trim() || "price",
+        condition: parseJsonInput(ruleForm.condition),
+        action: parseJsonInput(ruleForm.action),
+        cadence: ruleForm.cadence.trim() || null,
+        is_enabled: ruleForm.is_enabled,
+      });
+      setRuleForm((prev) => ({ ...prev, name: "" }));
+      toast.success("自动跟踪规则已创建");
+      await load();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "创建规则失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const startEditRule = (item: PortfolioTrackingRule) => {
+    setEditingRuleId(item.id);
+    setRuleDraft({
+      instrument_id: item.instrument_id || "",
+      name: item.name,
+      rule_type: item.rule_type,
+      cadence: item.cadence || "",
+      condition: JSON.stringify(item.condition || {}, null, 2),
+      action: JSON.stringify(item.action || {}, null, 2),
+      is_enabled: item.is_enabled ? "true" : "false",
+    });
+  };
+
+  const saveTrackingRule = async (id: string) => {
+    setSaving(true);
+    try {
+      await api.portfolio.updateTrackingRule(id, {
+        instrument_id: ruleDraft.instrument_id || null,
+        name: ruleDraft.name,
+        rule_type: ruleDraft.rule_type,
+        cadence: ruleDraft.cadence || null,
+        condition: parseJsonInput(ruleDraft.condition || "{}"),
+        action: parseJsonInput(ruleDraft.action || "{}"),
+        is_enabled: ruleDraft.is_enabled !== "false",
+      });
+      setEditingRuleId(null);
+      toast.success("规则已更新");
+      await load();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "更新规则失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const deleteTrackingRule = async (id: string) => {
+    if (!window.confirm("确认删除这条自动跟踪规则吗？")) return;
+    setSaving(true);
+    try {
+      await api.portfolio.deleteTrackingRule(id);
+      toast.success("规则已删除");
+      await load();
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "删除规则失败");
     } finally {
       setSaving(false);
     }
@@ -440,20 +581,25 @@ export function InvestmentWorkspace() {
           <div className="overflow-auto">
             <table className="w-full text-sm">
               <thead className="bg-muted/50 text-xs text-muted-foreground">
-                <tr><th className="px-3 py-2 text-left">标的</th><th className="px-3 py-2 text-right">数量</th><th className="px-3 py-2 text-right">均价</th><th className="px-3 py-2 text-right">目标权重</th><th className="px-3 py-2 text-right">止损/止盈</th><th className="px-3 py-2 text-right">市值</th><th className="px-3 py-2 text-right">盈亏</th><th className="px-3 py-2 text-left">备注</th><th className="px-3 py-2 text-right">操作</th></tr>
+                <tr><th className="px-3 py-2 text-left">标的</th><th className="px-3 py-2 text-right">数量</th><th className="px-3 py-2 text-right">均价</th><th className="px-3 py-2 text-right">目标/实际</th><th className="px-3 py-2 text-right">偏离</th><th className="px-3 py-2 text-right">止损/止盈</th><th className="px-3 py-2 text-right">市值</th><th className="px-3 py-2 text-right">盈亏</th><th className="px-3 py-2 text-left">行情时间</th><th className="px-3 py-2 text-left">备注</th><th className="px-3 py-2 text-right">操作</th></tr>
               </thead>
               <tbody>
                 {positions.length ? positions.map((item) => {
                   const editing = editingPositionId === item.id;
                   return (
                   <tr key={item.id} className="border-t align-top">
-                    <td className="px-3 py-2 font-medium">{item.instrument?.symbol ?? item.instrument_id}</td>
+                    <td className="px-3 py-2 font-medium">
+                      {item.instrument?.symbol ?? item.instrument_id}
+                      <div className="text-xs font-normal text-muted-foreground">{item.instrument?.name}</div>
+                    </td>
                     <td className="px-3 py-2 text-right">{editing ? <input className="w-24 rounded-md border bg-background px-2 py-1 text-right" value={positionDraft.quantity || ""} onChange={(e) => setPositionDraft({ ...positionDraft, quantity: e.target.value })} /> : money(item.quantity)}</td>
                     <td className="px-3 py-2 text-right">{editing ? <input className="w-24 rounded-md border bg-background px-2 py-1 text-right" value={positionDraft.avg_cost || ""} onChange={(e) => setPositionDraft({ ...positionDraft, avg_cost: e.target.value })} /> : money(item.avg_cost)}</td>
-                    <td className="px-3 py-2 text-right">{editing ? <input className="w-20 rounded-md border bg-background px-2 py-1 text-right" value={positionDraft.target_weight || ""} onChange={(e) => setPositionDraft({ ...positionDraft, target_weight: e.target.value })} /> : (item.target_weight != null ? pctFmt.format(item.target_weight) : "-")}</td>
+                    <td className="px-3 py-2 text-right">{editing ? <input className="w-20 rounded-md border bg-background px-2 py-1 text-right" title="输入百分比，例如 20 表示 20%" value={positionDraft.target_weight || ""} onChange={(e) => setPositionDraft({ ...positionDraft, target_weight: e.target.value })} /> : `${item.target_weight != null ? pctFmt.format(item.target_weight) : "-"} / ${item.actual_weight != null ? pctFmt.format(item.actual_weight) : "-"}`}</td>
+                    <td className={cn("px-3 py-2 text-right", item.weight_drift != null && Math.abs(item.weight_drift) >= 0.02 ? "text-warning font-medium" : "text-muted-foreground")} title="实际权重 - 目标权重">{item.weight_drift != null ? pctFmt.format(item.weight_drift) : "-"}</td>
                     <td className="px-3 py-2 text-right">{editing ? <div className="flex justify-end gap-1"><input className="w-20 rounded-md border bg-background px-2 py-1 text-right" placeholder="止损" value={positionDraft.stop_loss || ""} onChange={(e) => setPositionDraft({ ...positionDraft, stop_loss: e.target.value })} /><input className="w-20 rounded-md border bg-background px-2 py-1 text-right" placeholder="止盈" value={positionDraft.take_profit || ""} onChange={(e) => setPositionDraft({ ...positionDraft, take_profit: e.target.value })} /></div> : `${item.stop_loss ?? "-"} / ${item.take_profit ?? "-"}`}</td>
                     <td className="px-3 py-2 text-right">{money(item.market_value)}</td>
                     <td className={cn("px-3 py-2 text-right", item.unrealized_pnl >= 0 ? "text-success" : "text-danger")}>{money(item.unrealized_pnl)} · {pctFmt.format(item.unrealized_pnl_pct || 0)}</td>
+                    <td className="px-3 py-2 text-xs text-muted-foreground">{timeText(item.market_price_as_of)}<div>{item.market_price_source || "-"}</div></td>
                     <td className="max-w-[280px] px-3 py-2 text-muted-foreground">{editing ? <input className="w-full rounded-md border bg-background px-2 py-1" value={positionDraft.notes || ""} onChange={(e) => setPositionDraft({ ...positionDraft, notes: e.target.value })} /> : <span className="line-clamp-2">{item.notes || "-"}</span>}</td>
                     <td className="px-3 py-2">
                       <div className="flex justify-end gap-1">
@@ -471,7 +617,7 @@ export function InvestmentWorkspace() {
                       </div>
                     </td>
                   </tr>
-                )}) : <EmptyRow colSpan={9} text={loading ? "加载中..." : "暂无持仓"} />}
+                )}) : <EmptyRow colSpan={11} text={loading ? "加载中..." : "暂无持仓"} />}
               </tbody>
             </table>
           </div>
@@ -480,7 +626,7 @@ export function InvestmentWorkspace() {
         <section className="rounded-md border bg-card">
           <div className="flex items-center gap-2 border-b px-4 py-3">
             <Target className="h-4 w-4 text-primary" />
-            <h2 className="text-sm font-semibold">关注列表管理</h2>
+            <h2 className="text-sm font-semibold">关注列表</h2>
           </div>
           <div className="overflow-auto">
             <table className="w-full text-sm">
@@ -522,6 +668,158 @@ export function InvestmentWorkspace() {
           </div>
         </section>
 
+        <div className="grid gap-4 xl:grid-cols-[1.15fr_0.85fr]">
+          <section className="rounded-md border bg-card">
+            <div className="flex items-center gap-2 border-b px-4 py-3">
+              <TriangleAlert className="h-4 w-4 text-primary" />
+              <h2 className="text-sm font-semibold">自动跟踪规则</h2>
+            </div>
+            <div className="grid gap-3 border-b p-4 md:grid-cols-6">
+              <input className="rounded-md border bg-background px-3 py-2 text-sm md:col-span-2" placeholder="规则名称" value={ruleForm.name} onChange={(e) => setRuleForm({ ...ruleForm, name: e.target.value })} />
+              <select className="rounded-md border bg-background px-3 py-2 text-sm" value={ruleForm.instrument_id} onChange={(e) => setRuleForm({ ...ruleForm, instrument_id: e.target.value })}>
+                <option value="">组合级</option>
+                {instruments.map((item) => <option key={item.id} value={item.id}>{item.symbol}</option>)}
+              </select>
+              <input className="rounded-md border bg-background px-3 py-2 text-sm" placeholder="类型" value={ruleForm.rule_type} onChange={(e) => setRuleForm({ ...ruleForm, rule_type: e.target.value })} />
+              <input className="rounded-md border bg-background px-3 py-2 text-sm" placeholder="频率" value={ruleForm.cadence} onChange={(e) => setRuleForm({ ...ruleForm, cadence: e.target.value })} />
+              <label className="flex items-center gap-2 text-sm text-muted-foreground"><input type="checkbox" checked={ruleForm.is_enabled} onChange={(e) => setRuleForm({ ...ruleForm, is_enabled: e.target.checked })} />启用</label>
+              <textarea className="min-h-20 rounded-md border bg-background px-3 py-2 font-mono text-xs md:col-span-3" value={ruleForm.condition} onChange={(e) => setRuleForm({ ...ruleForm, condition: e.target.value })} />
+              <textarea className="min-h-20 rounded-md border bg-background px-3 py-2 font-mono text-xs md:col-span-3" value={ruleForm.action} onChange={(e) => setRuleForm({ ...ruleForm, action: e.target.value })} />
+              <button onClick={createTrackingRule} disabled={saving || !ruleForm.name} className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50">
+                <Plus className="h-4 w-4" />
+                新增规则
+              </button>
+            </div>
+            <div className="overflow-auto">
+              <table className="w-full min-w-[960px] text-sm">
+                <thead className="bg-muted/50 text-xs text-muted-foreground">
+                  <tr><th className="px-3 py-2 text-left">名称</th><th className="px-3 py-2 text-left">标的</th><th className="px-3 py-2 text-left">类型/频率</th><th className="px-3 py-2 text-left">条件</th><th className="px-3 py-2 text-left">动作</th><th className="px-3 py-2 text-left">状态</th><th className="px-3 py-2 text-right">操作</th></tr>
+                </thead>
+                <tbody>
+                  {trackingRules.length ? trackingRules.map((item) => {
+                    const editing = editingRuleId === item.id;
+                    const instrument = instruments.find((inst) => inst.id === item.instrument_id);
+                    return (
+                      <tr key={item.id} className="border-t align-top">
+                        <td className="px-3 py-2 font-medium">{editing ? <input className="w-40 rounded-md border bg-background px-2 py-1" value={ruleDraft.name || ""} onChange={(e) => setRuleDraft({ ...ruleDraft, name: e.target.value })} /> : item.name}</td>
+                        <td className="px-3 py-2">{editing ? <select className="w-28 rounded-md border bg-background px-2 py-1" value={ruleDraft.instrument_id || ""} onChange={(e) => setRuleDraft({ ...ruleDraft, instrument_id: e.target.value })}><option value="">组合级</option>{instruments.map((inst) => <option key={inst.id} value={inst.id}>{inst.symbol}</option>)}</select> : instrument?.symbol || "组合级"}</td>
+                        <td className="px-3 py-2">{editing ? <div className="grid gap-1"><input className="w-32 rounded-md border bg-background px-2 py-1" value={ruleDraft.rule_type || ""} onChange={(e) => setRuleDraft({ ...ruleDraft, rule_type: e.target.value })} /><input className="w-32 rounded-md border bg-background px-2 py-1" value={ruleDraft.cadence || ""} onChange={(e) => setRuleDraft({ ...ruleDraft, cadence: e.target.value })} /></div> : <>{item.rule_type}<div className="text-xs text-muted-foreground">{item.cadence || "-"}</div></>}</td>
+                        <td className="max-w-[240px] px-3 py-2">{editing ? <textarea className="h-24 w-64 rounded-md border bg-background px-2 py-1 font-mono text-xs" value={ruleDraft.condition || "{}"} onChange={(e) => setRuleDraft({ ...ruleDraft, condition: e.target.value })} /> : <code className="line-clamp-3 text-xs text-muted-foreground">{compactJson(item.condition)}</code>}</td>
+                        <td className="max-w-[220px] px-3 py-2">{editing ? <textarea className="h-24 w-56 rounded-md border bg-background px-2 py-1 font-mono text-xs" value={ruleDraft.action || "{}"} onChange={(e) => setRuleDraft({ ...ruleDraft, action: e.target.value })} /> : <code className="line-clamp-3 text-xs text-muted-foreground">{compactJson(item.action)}</code>}</td>
+                        <td className="px-3 py-2">{editing ? <select className="rounded-md border bg-background px-2 py-1" value={ruleDraft.is_enabled || "true"} onChange={(e) => setRuleDraft({ ...ruleDraft, is_enabled: e.target.value })}><option value="true">启用</option><option value="false">停用</option></select> : item.is_enabled ? "启用" : "停用"}</td>
+                        <td className="px-3 py-2">
+                          <div className="flex justify-end gap-1">
+                            {editing ? (
+                              <>
+                                <button onClick={() => saveTrackingRule(item.id)} className="rounded-md border p-1.5 hover:bg-muted" title="保存"><Save className="h-4 w-4" /></button>
+                                <button onClick={() => setEditingRuleId(null)} className="rounded-md border p-1.5 hover:bg-muted" title="取消"><X className="h-4 w-4" /></button>
+                              </>
+                            ) : (
+                              <>
+                                <button onClick={() => startEditRule(item)} className="rounded-md border p-1.5 hover:bg-muted" title="编辑"><Pencil className="h-4 w-4" /></button>
+                                <button onClick={() => deleteTrackingRule(item.id)} className="rounded-md border p-1.5 text-danger hover:bg-danger/10" title="删除"><Trash2 className="h-4 w-4" /></button>
+                              </>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  }) : <EmptyRow colSpan={7} text={loading ? "加载中..." : "暂无规则"} />}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section className="rounded-md border bg-card">
+            <div className="flex items-center justify-between gap-3 border-b px-4 py-3">
+              <div className="flex items-center gap-2">
+                <ClipboardList className="h-4 w-4 text-primary" />
+                <h2 className="text-sm font-semibold">规则触发事件</h2>
+              </div>
+              <div className="text-xs text-muted-foreground">每页 10 条</div>
+            </div>
+            <div className="overflow-auto">
+              <table className="w-full min-w-[720px] text-sm">
+                <thead className="bg-muted/50 text-xs text-muted-foreground">
+                  <tr><th className="px-3 py-2 text-left">时间</th><th className="px-3 py-2 text-left">规则</th><th className="px-3 py-2 text-left">标的</th><th className="px-3 py-2 text-left">原因</th><th className="px-3 py-2 text-left">状态</th></tr>
+                </thead>
+                <tbody>
+                  {ruleEvents?.items.length ? ruleEvents.items.map((event) => (
+                    <tr key={event.id} className="border-t align-top">
+                      <td className="px-3 py-2 text-xs text-muted-foreground">{timeText(event.triggered_at)}</td>
+                      <td className="px-3 py-2">{event.rule_name || event.rule_id}<div className="text-xs text-muted-foreground">{event.rule_type || "-"}</div></td>
+                      <td className="px-3 py-2">{String(event.payload.symbol || event.payload.instrument_id || "组合级")}</td>
+                      <td className="max-w-[260px] px-3 py-2 text-muted-foreground">{String(event.payload.reason || compactJson(event.payload))}</td>
+                      <td className="px-3 py-2">{event.status}</td>
+                    </tr>
+                  )) : <EmptyRow colSpan={5} text={loading ? "加载中..." : "暂无触发事件"} />}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex items-center justify-between border-t px-4 py-3 text-sm">
+              <span className="text-muted-foreground">共 {ruleEvents?.total ?? 0} 条</span>
+              <div className="flex gap-2">
+                <button className="rounded-md border px-3 py-1.5 disabled:opacity-50" disabled={ruleEventOffset <= 0} onClick={() => setRuleEventOffset(Math.max(0, ruleEventOffset - 10))}>上一页</button>
+                <button className="rounded-md border px-3 py-1.5 disabled:opacity-50" disabled={(ruleEventOffset + 10) >= (ruleEvents?.total ?? 0)} onClick={() => setRuleEventOffset(ruleEventOffset + 10)}>下一页</button>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div className="grid gap-4 lg:grid-cols-2">
+          <section className="rounded-md border bg-card">
+            <div className="flex items-center gap-2 border-b px-4 py-3">
+              <FileText className="h-4 w-4 text-primary" />
+              <h2 className="text-sm font-semibold">最近研报</h2>
+            </div>
+            <div className="divide-y">
+              {reports.length ? reports.map((report) => (
+                <div key={report.id} className="p-4">
+                  <div className="text-sm font-medium">{report.title}</div>
+                  <p className="mt-1 line-clamp-2 text-sm text-muted-foreground">{report.summary || report.content || "无摘要"}</p>
+                </div>
+              )) : <div className="p-8 text-center text-sm text-muted-foreground">暂无研报</div>}
+            </div>
+          </section>
+
+          <section className="rounded-md border bg-card">
+            <div className="flex items-center gap-2 border-b px-4 py-3">
+              <ClipboardList className="h-4 w-4 text-primary" />
+              <h2 className="text-sm font-semibold">决策日志</h2>
+            </div>
+            <div className="grid gap-3 border-b p-4 md:grid-cols-4">
+              <select className="rounded-md border bg-background px-3 py-2 text-sm" value={decisionForm.decision_type} onChange={(e) => setDecisionForm({ ...decisionForm, decision_type: e.target.value })}>
+                <option value="watch">观察</option>
+                <option value="buy">买入</option>
+                <option value="sell">卖出</option>
+                <option value="hold">持有</option>
+                <option value="rebalance">调仓</option>
+              </select>
+              <select className="rounded-md border bg-background px-3 py-2 text-sm" value={decisionForm.instrument_id} onChange={(e) => setDecisionForm({ ...decisionForm, instrument_id: e.target.value })}>
+                <option value="">组合级</option>
+                {instruments.map((item) => <option key={item.id} value={item.id}>{item.symbol}</option>)}
+              </select>
+              <input className="rounded-md border bg-background px-3 py-2 text-sm md:col-span-2" placeholder="决策标题" value={decisionForm.title} onChange={(e) => setDecisionForm({ ...decisionForm, title: e.target.value })} />
+              <textarea className="min-h-20 rounded-md border bg-background px-3 py-2 text-sm md:col-span-4" placeholder="决策依据" value={decisionForm.rationale} onChange={(e) => setDecisionForm({ ...decisionForm, rationale: e.target.value })} />
+              <button onClick={createDecision} disabled={saving || !decisionForm.title || !decisionForm.rationale} className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50">
+                <Plus className="h-4 w-4" />
+                记录决策
+              </button>
+            </div>
+            <div className="divide-y">
+              {decisions.length ? decisions.map((item) => (
+                <div key={item.id} className="p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-medium">{item.title}</div>
+                    <span className="rounded border px-2 py-0.5 text-xs text-muted-foreground">{item.decision_type}</span>
+                  </div>
+                  <p className="mt-1 line-clamp-2 text-sm text-muted-foreground">{item.rationale}</p>
+                </div>
+              )) : <div className="p-8 text-center text-sm text-muted-foreground">暂无决策</div>}
+            </div>
+          </section>
+        </div>
+
         <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
           <section className="rounded-md border bg-card">
             <div className="flex items-center gap-2 border-b px-4 py-3">
@@ -547,6 +845,7 @@ export function InvestmentWorkspace() {
                 <tbody>
                   {instruments.length ? instruments.map((item) => {
                     const editing = editingInstrumentId === item.id;
+                    const watchlisted = watchlistedInstrumentIds.has(item.id);
                     return (
                     <tr key={item.id} className="border-t align-top">
                       <td className="px-3 py-2 font-medium">{editing ? <input className="w-24 rounded-md border bg-background px-2 py-1" value={instrumentDraft.symbol || ""} onChange={(e) => setInstrumentDraft({ ...instrumentDraft, symbol: e.target.value })} /> : item.symbol}</td>
@@ -563,6 +862,7 @@ export function InvestmentWorkspace() {
                             </>
                           ) : (
                             <>
+                              <button onClick={() => addToWatchlist(item)} disabled={saving || watchlisted} className="rounded-md border p-1.5 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-45" title={watchlisted ? "已关注" : "加关注"}><Eye className="h-4 w-4" /></button>
                               <button onClick={() => startEditInstrument(item)} className="rounded-md border p-1.5 hover:bg-muted" title="编辑"><Pencil className="h-4 w-4" /></button>
                               <button onClick={() => deleteInstrument(item.id)} className="rounded-md border p-1.5 text-danger hover:bg-danger/10" title="删除"><Trash2 className="h-4 w-4" /></button>
                             </>
@@ -589,7 +889,7 @@ export function InvestmentWorkspace() {
               <div className="grid grid-cols-3 gap-3">
                 <input className="rounded-md border bg-background px-3 py-2 text-sm" placeholder="数量" value={positionForm.quantity} onChange={(e) => setPositionForm({ ...positionForm, quantity: e.target.value })} />
                 <input className="rounded-md border bg-background px-3 py-2 text-sm" placeholder="均价" value={positionForm.avg_cost} onChange={(e) => setPositionForm({ ...positionForm, avg_cost: e.target.value })} />
-                <input className="rounded-md border bg-background px-3 py-2 text-sm" placeholder="目标权重" value={positionForm.target_weight} onChange={(e) => setPositionForm({ ...positionForm, target_weight: e.target.value })} />
+                <input className="rounded-md border bg-background px-3 py-2 text-sm" placeholder="目标权重 %" title="输入百分比，例如 20 表示 20%" value={positionForm.target_weight} onChange={(e) => setPositionForm({ ...positionForm, target_weight: e.target.value })} />
               </div>
               <textarea className="min-h-20 w-full rounded-md border bg-background px-3 py-2 text-sm" placeholder={selectedInstrument ? `${selectedInstrument.symbol} 持仓备注` : "持仓备注"} value={positionForm.notes} onChange={(e) => setPositionForm({ ...positionForm, notes: e.target.value })} />
               <button onClick={createPosition} disabled={saving || !positionForm.instrument_id || !positionForm.quantity || !positionForm.avg_cost} className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50">
@@ -687,9 +987,9 @@ export function InvestmentWorkspace() {
                             <td className="px-3 py-2"><input className="w-36 rounded-md border bg-background px-2 py-1" value={item.name ?? ""} onChange={(e) => updateImportItem(idx, { name: e.target.value })} /></td>
                             <td className="px-3 py-2"><input className="w-20 rounded-md border bg-background px-2 py-1" value={item.market ?? ""} onChange={(e) => updateImportItem(idx, { market: e.target.value })} /></td>
                             <td className="px-3 py-2"><input className="w-20 rounded-md border bg-background px-2 py-1" value={item.currency ?? ""} onChange={(e) => updateImportItem(idx, { currency: e.target.value })} /></td>
-                            <td className="px-3 py-2"><input className="w-24 rounded-md border bg-background px-2 py-1 text-right" value={item.quantity ?? ""} onChange={(e) => updateImportItem(idx, { quantity: Number(e.target.value) || null })} /></td>
-                            <td className="px-3 py-2"><input className="w-24 rounded-md border bg-background px-2 py-1 text-right" value={item.avg_cost ?? ""} onChange={(e) => updateImportItem(idx, { avg_cost: Number(e.target.value) || null })} /></td>
-                            <td className="px-3 py-2"><input className="w-24 rounded-md border bg-background px-2 py-1 text-right" value={item.market_price ?? ""} onChange={(e) => updateImportItem(idx, { market_price: Number(e.target.value) || null })} /></td>
+                            <td className="px-3 py-2"><input className="w-24 rounded-md border bg-background px-2 py-1 text-right" value={item.quantity ?? ""} onChange={(e) => updateImportItem(idx, { quantity: optionalNumberInput(e.target.value) })} /></td>
+                            <td className="px-3 py-2"><input className="w-24 rounded-md border bg-background px-2 py-1 text-right" value={item.avg_cost ?? ""} onChange={(e) => updateImportItem(idx, { avg_cost: optionalNumberInput(e.target.value) })} /></td>
+                            <td className="px-3 py-2"><input className="w-24 rounded-md border bg-background px-2 py-1 text-right" value={item.market_price ?? ""} onChange={(e) => updateImportItem(idx, { market_price: optionalNumberInput(e.target.value) })} /></td>
                             <td className="max-w-[260px] px-3 py-2 text-xs text-muted-foreground">
                               {[...item.missing_fields.map((field) => `缺 ${field}`), ...item.warnings].join("；") || `置信度 ${pctFmt.format(item.confidence || 0)}`}
                             </td>
@@ -705,60 +1005,6 @@ export function InvestmentWorkspace() {
             </div>
           </div>
         </section>
-
-        <div className="grid gap-4 lg:grid-cols-2">
-          <section className="rounded-md border bg-card">
-            <div className="flex items-center gap-2 border-b px-4 py-3">
-              <FileText className="h-4 w-4 text-primary" />
-              <h2 className="text-sm font-semibold">最近研报</h2>
-            </div>
-            <div className="divide-y">
-              {reports.length ? reports.map((report) => (
-                <div key={report.id} className="p-4">
-                  <div className="text-sm font-medium">{report.title}</div>
-                  <p className="mt-1 line-clamp-2 text-sm text-muted-foreground">{report.summary || report.content || "无摘要"}</p>
-                </div>
-              )) : <div className="p-8 text-center text-sm text-muted-foreground">暂无研报</div>}
-            </div>
-          </section>
-
-          <section className="rounded-md border bg-card">
-            <div className="flex items-center gap-2 border-b px-4 py-3">
-              <ClipboardList className="h-4 w-4 text-primary" />
-              <h2 className="text-sm font-semibold">决策日志</h2>
-            </div>
-            <div className="grid gap-3 border-b p-4 md:grid-cols-4">
-              <select className="rounded-md border bg-background px-3 py-2 text-sm" value={decisionForm.decision_type} onChange={(e) => setDecisionForm({ ...decisionForm, decision_type: e.target.value })}>
-                <option value="watch">观察</option>
-                <option value="buy">买入</option>
-                <option value="sell">卖出</option>
-                <option value="hold">持有</option>
-                <option value="rebalance">调仓</option>
-              </select>
-              <select className="rounded-md border bg-background px-3 py-2 text-sm" value={decisionForm.instrument_id} onChange={(e) => setDecisionForm({ ...decisionForm, instrument_id: e.target.value })}>
-                <option value="">组合级</option>
-                {instruments.map((item) => <option key={item.id} value={item.id}>{item.symbol}</option>)}
-              </select>
-              <input className="rounded-md border bg-background px-3 py-2 text-sm md:col-span-2" placeholder="决策标题" value={decisionForm.title} onChange={(e) => setDecisionForm({ ...decisionForm, title: e.target.value })} />
-              <textarea className="min-h-20 rounded-md border bg-background px-3 py-2 text-sm md:col-span-4" placeholder="决策依据" value={decisionForm.rationale} onChange={(e) => setDecisionForm({ ...decisionForm, rationale: e.target.value })} />
-              <button onClick={createDecision} disabled={saving || !decisionForm.title || !decisionForm.rationale} className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50">
-                <Plus className="h-4 w-4" />
-                记录决策
-              </button>
-            </div>
-            <div className="divide-y">
-              {decisions.length ? decisions.map((item) => (
-                <div key={item.id} className="p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="text-sm font-medium">{item.title}</div>
-                    <span className="rounded border px-2 py-0.5 text-xs text-muted-foreground">{item.decision_type}</span>
-                  </div>
-                  <p className="mt-1 line-clamp-2 text-sm text-muted-foreground">{item.rationale}</p>
-                </div>
-              )) : <div className="p-8 text-center text-sm text-muted-foreground">暂无决策</div>}
-            </div>
-          </section>
-        </div>
 
         {watchlist.length ? (
           <div className="text-xs text-muted-foreground">

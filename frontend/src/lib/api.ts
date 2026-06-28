@@ -126,10 +126,14 @@ export interface PortfolioPosition {
   avg_cost: number;
   cost_basis: number;
   target_weight?: number | null;
+  actual_weight?: number | null;
+  weight_drift?: number | null;
   stop_loss?: number | null;
   take_profit?: number | null;
   notes?: string | null;
   market_price?: number | null;
+  market_price_as_of?: string | null;
+  market_price_source?: string | null;
   market_value: number;
   unrealized_pnl: number;
   unrealized_pnl_pct: number;
@@ -166,6 +170,40 @@ export interface PortfolioDecision {
   status: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface PortfolioTrackingRule {
+  id: string;
+  instrument_id?: string | null;
+  name: string;
+  rule_type: string;
+  condition: Record<string, unknown>;
+  action: Record<string, unknown>;
+  cadence?: string | null;
+  next_run_date?: string | null;
+  is_enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PortfolioRuleEvent {
+  id: string;
+  rule_id: string;
+  rule_name?: string | null;
+  rule_type?: string | null;
+  triggered_at: string;
+  status: string;
+  payload: Record<string, unknown>;
+  result: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PortfolioRuleEventPage {
+  total: number;
+  limit: number;
+  offset: number;
+  items: PortfolioRuleEvent[];
 }
 
 export interface PositionImportItem {
@@ -348,6 +386,15 @@ export const api = {
     listDecisions: () => request<PortfolioDecision[]>("/portfolio/decisions?limit=10"),
     createDecision: (body: { instrument_id?: string | null; decision_type: string; title: string; rationale: string; expected_outcome?: string }) =>
       request<PortfolioDecision>("/portfolio/decisions", { method: "POST", body: JSON.stringify(body) }),
+    listTrackingRules: () => request<PortfolioTrackingRule[]>("/portfolio/tracking-rules"),
+    createTrackingRule: (body: Partial<PortfolioTrackingRule> & { name: string; rule_type: string }) =>
+      request<PortfolioTrackingRule>("/portfolio/tracking-rules", { method: "POST", body: JSON.stringify(body) }),
+    updateTrackingRule: (id: string, body: Partial<PortfolioTrackingRule>) =>
+      request<PortfolioTrackingRule>(`/portfolio/tracking-rules/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+    deleteTrackingRule: (id: string) =>
+      request<{ status: string }>(`/portfolio/tracking-rules/${id}`, { method: "DELETE" }),
+    listRuleEvents: (offset = 0, limit = 10) =>
+      request<PortfolioRuleEventPage>(`/portfolio/rule-events?offset=${offset}&limit=${limit}`),
     listImports: () => request<PositionImportJob[]>("/portfolio/imports?limit=10"),
     uploadPositionScreenshot,
     updateImport: (jobId: string, body: { broker?: string | null; account_name?: string | null; summary?: string | null; items?: PositionImportItemPatch[] }) =>

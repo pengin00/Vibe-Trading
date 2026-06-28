@@ -3913,6 +3913,68 @@ def _dispatch_connector(args: argparse.Namespace) -> int:
     return EXIT_USAGE_ERROR
 
 
+def cmd_portfolio_autopilot_once(max_targets: int, *, refresh_prices: bool, create_reports: bool, json_mode: bool) -> int:
+    """Run one Investment Workspace autopilot pass."""
+    from src.portfolio import autopilot
+
+    result = autopilot.run_once(
+        max_targets=max_targets,
+        create_reports=create_reports,
+        price_provider=autopilot.default_price_provider if refresh_prices else None,
+    )
+    payload = result.as_dict()
+    if json_mode:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        table = Table(title="Portfolio Autopilot", box=box.SIMPLE_HEAVY)
+        table.add_column("Metric")
+        table.add_column("Value")
+        table.add_row("Status", payload["status"])
+        table.add_row("Targets", str(len(payload["targets"])))
+        table.add_row("Price snapshots", str(len(payload["price_snapshots"])))
+        table.add_row("Rule events", str(len(payload["triggered_events"])))
+        table.add_row("Research reports", str(len(payload["research_reports"])))
+        if payload["errors"]:
+            table.add_row("Errors", "; ".join(payload["errors"]))
+        console.print(table)
+    return EXIT_SUCCESS if result.status == "ok" else EXIT_RUN_FAILED
+
+
+def cmd_portfolio_autopilot_watch(interval_seconds: int, max_targets: int) -> int:
+    """Run the autopilot repeatedly in the foreground."""
+    from src.portfolio import autopilot
+
+    console.print(
+        f"[green]Portfolio autopilot watching every {interval_seconds}s; press Ctrl+C to stop.[/green]"
+    )
+    try:
+        while True:
+            result = autopilot.run_once(max_targets=max_targets)
+            console.print(
+                f"[dim]{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[/dim] "
+                f"status={result.status} targets={len(result.targets)} reports={len(result.research_reports)}"
+            )
+            time.sleep(max(60, interval_seconds))
+    except KeyboardInterrupt:
+        console.print("[yellow]Portfolio autopilot stopped.[/yellow]")
+        return EXIT_SUCCESS
+
+
+def _dispatch_portfolio(args: argparse.Namespace) -> int:
+    sub = getattr(args, "portfolio_command", None)
+    if sub != "autopilot":
+        console.print("[red]portfolio requires a subcommand.[/red] Try: vibe-trading portfolio autopilot --once")
+        return EXIT_USAGE_ERROR
+    if args.watch:
+        return cmd_portfolio_autopilot_watch(args.interval_seconds, args.max_targets)
+    return cmd_portfolio_autopilot_once(
+        args.max_targets,
+        refresh_prices=not args.no_refresh_prices,
+        create_reports=not args.no_reports,
+        json_mode=args.json,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI entrypoint
 # ---------------------------------------------------------------------------
@@ -4084,6 +4146,17 @@ def _build_parser() -> argparse.ArgumentParser:
     ):
         p = connector_subparsers.add_parser(name, help=help_text)
         _add_connector_profile_arg(p)
+
+    portfolio_parser = subparsers.add_parser("portfolio", help="Manage Investment Workspace automation")
+    portfolio_subparsers = portfolio_parser.add_subparsers(dest="portfolio_command")
+    portfolio_autopilot = portfolio_subparsers.add_parser("autopilot", help="Run scheduled portfolio research")
+    portfolio_autopilot.add_argument("--once", action="store_true", help="Run once (default)")
+    portfolio_autopilot.add_argument("--watch", action="store_true", help="Run repeatedly in the foreground")
+    portfolio_autopilot.add_argument("--interval-seconds", type=int, default=3600, help="Foreground watch interval")
+    portfolio_autopilot.add_argument("--max-targets", type=int, default=10, help="Maximum instruments per run")
+    portfolio_autopilot.add_argument("--no-refresh-prices", action="store_true", help="Use existing price snapshots only")
+    portfolio_autopilot.add_argument("--no-reports", action="store_true", help="Evaluate targets/rules without writing reports")
+    portfolio_autopilot.add_argument("--json", action="store_true", help="Print machine-readable JSON output")
 
     # Alpha Zoo subcommands (registered via cli_handlers.add_subparser)
     from src.factors.cli_handlers import add_subparser as _add_alpha_subparser
@@ -4592,6 +4665,8 @@ def main(argv: list[str] | None = None) -> int:
         return _coerce_exit_code(_hyp_dispatch(args))
     if args.command == "connector":
         return _coerce_exit_code(_dispatch_connector(args))
+    if args.command == "portfolio":
+        return _coerce_exit_code(_dispatch_portfolio(args))
     if args.command == "memory":
         if args.memory_command == "list":
             return _coerce_exit_code(cmd_memory_list(args.memory_type))

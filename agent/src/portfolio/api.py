@@ -10,6 +10,7 @@ from . import schemas as s
 from .db import PortfolioDatabaseUnavailable, session_scope
 from . import service
 from . import import_service
+from . import autopilot
 
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 
@@ -30,6 +31,35 @@ def health(session=Depends(db_session)):
 @router.get("/dashboard", response_model=s.PortfolioDashboard)
 def dashboard(session=Depends(db_session)):
     return service.dashboard(session)
+
+
+@router.post("/autopilot/run", response_model=s.PortfolioAutopilotRunResponse)
+def run_autopilot(payload: s.PortfolioAutopilotRunRequest):
+    price_provider = autopilot.default_price_provider if payload.refresh_prices else None
+    return autopilot.run_once(
+        max_targets=payload.max_targets,
+        price_provider=price_provider,
+        create_reports=payload.create_reports,
+    ).as_dict()
+
+
+@router.post("/autopilot/schedule")
+def schedule_autopilot(payload: s.PortfolioAutopilotScheduleRequest):
+    return autopilot.api_runner.start(
+        interval_seconds=payload.interval_seconds,
+        max_targets=payload.max_targets,
+        run_immediately=payload.run_immediately,
+    )
+
+
+@router.post("/autopilot/stop")
+def stop_autopilot():
+    return autopilot.api_runner.stop()
+
+
+@router.get("/autopilot/status")
+def autopilot_status():
+    return autopilot.api_runner.status()
 
 
 @router.get("/accounts", response_model=list[s.PortfolioAccountOut])
@@ -106,10 +136,7 @@ def delete_watchlist_item(item_id: str, session=Depends(db_session)):
 
 @router.get("/positions", response_model=list[s.PositionOut])
 def list_positions(session=Depends(db_session)):
-    return [
-        {**p.__dict__, **service.position_metrics(session, p)}
-        for p in service.list_positions(session)
-    ]
+    return service.positions_with_metrics(session)
 
 
 @router.post("/positions", response_model=s.PositionOut, status_code=201)
@@ -182,6 +209,22 @@ def update_tracking_rule(rule_id: str, payload: s.TrackingRuleUpdate, session=De
     if not rule:
         raise HTTPException(status_code=404, detail="Tracking rule not found")
     return rule
+
+
+@router.delete("/tracking-rules/{rule_id}")
+def delete_tracking_rule(rule_id: str, session=Depends(db_session)):
+    if not service.delete_tracking_rule(session, rule_id):
+        raise HTTPException(status_code=404, detail="Tracking rule not found")
+    return {"status": "ok"}
+
+
+@router.get("/rule-events", response_model=s.RuleTriggerEventPage)
+def list_rule_events(
+    limit: int = Query(10, ge=1, le=100, description="返回条数"),
+    offset: int = Query(0, ge=0, description="分页偏移"),
+    session=Depends(db_session),
+):
+    return service.list_rule_events(session, limit=limit, offset=offset)
 
 
 @router.get("/decisions", response_model=list[s.DecisionLogOut])

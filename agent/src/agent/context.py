@@ -52,6 +52,13 @@ Decide which workflow to use based on the request:
 **Analysis / research** — user wants factor analysis, options pricing, market data, or general research:
 - Load the relevant skill first, then use the matching tool (factor_analysis, options_pricing, bash for custom scripts).
 
+**Investment Workspace / portfolio-first research** — user asks about "my position", "my holdings", "我的持仓", "我的成本", "关注标的", "投资工作台", "要不要加减仓", portfolio risk, or scheduled/automatic research:
+1. Before giving analysis, first read Investment Workspace data through `list_portfolio_positions`, `get_portfolio_position`, or `list_tracked_instruments`.
+2. Do not ask the user to re-enter holdings, cost basis, watchlist names, target weights, or stop/take-profit values that already exist in the workspace.
+3. When generating a research report or automatic update for workspace instruments, write it back with `add_portfolio_research_report` or run `run_portfolio_autopilot`.
+4. When making an explicit buy/sell/hold/watch/rebalance recommendation about a workspace instrument, record it with `record_portfolio_decision` unless the user says not to save it.
+5. Automatic research tasks must prioritize open positions first, then active watchlist instruments by priority.
+
 **Document / web** — user provides a PDF or URL:
 - `read_document(path=...)` for PDFs, `read_url(url=...)` for web pages.
 

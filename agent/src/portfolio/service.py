@@ -17,28 +17,72 @@ def _values(payload: Any) -> dict[str, Any]:
     return dict(payload)
 
 
-def _latest_price(session, instrument_id: str) -> float | None:
-    row = session.execute(
-        select(m.PriceSnapshot.price)
+def _latest_price_snapshot(session, instrument_id: str) -> m.PriceSnapshot | None:
+    return session.execute(
+        select(m.PriceSnapshot)
         .where(m.PriceSnapshot.instrument_id == instrument_id)
         .order_by(desc(m.PriceSnapshot.as_of))
         .limit(1)
     ).scalar_one_or_none()
-    return row
 
 
-def position_metrics(session, position: m.Position) -> dict[str, float | None]:
-    price = _latest_price(session, position.instrument_id) or position.avg_cost
+def _latest_price(session, instrument_id: str) -> float | None:
+    snapshot = _latest_price_snapshot(session, instrument_id)
+    return snapshot.price if snapshot else None
+
+
+def position_metrics(session, position: m.Position, total_market_value: float | None = None) -> dict[str, Any]:
+    snapshot = _latest_price_snapshot(session, position.instrument_id)
+    price = snapshot.price if snapshot else position.avg_cost
     market_value = float(position.quantity or 0) * float(price or 0)
     cost_basis = float(position.cost_basis or 0)
     pnl = market_value - cost_basis
     pnl_pct = pnl / cost_basis if cost_basis else 0.0
+    actual_weight = market_value / total_market_value if total_market_value else None
+    weight_drift = (
+        actual_weight - float(position.target_weight)
+        if actual_weight is not None and position.target_weight is not None
+        else None
+    )
     return {
         "market_price": price,
+        "market_price_as_of": snapshot.as_of if snapshot else None,
+        "market_price_source": snapshot.source if snapshot else "avg_cost_fallback",
         "market_value": market_value,
         "unrealized_pnl": pnl,
         "unrealized_pnl_pct": pnl_pct,
+        "actual_weight": actual_weight,
+        "weight_drift": weight_drift,
     }
+
+
+def ensure_default_tracking_rules(session) -> None:
+    """Create default workspace automation rules if missing."""
+
+    exists = session.execute(
+        select(m.TrackingRule)
+        .where(m.TrackingRule.name == "默认持仓行情刷新", m.TrackingRule.rule_type == "price_refresh")
+        .limit(1)
+    ).scalar_one_or_none()
+    if exists:
+        return
+    session.add(
+        m.TrackingRule(
+            name="默认持仓行情刷新",
+            rule_type="price_refresh",
+            condition={
+                "calendar": "weekdays",
+                "timezone": "Asia/Shanghai",
+                "times": ["09:35", "11:30", "14:30", "17:05"],
+                "min_daily_fetches": 4,
+                "note": "工作日至少刷新四次行情，最后一次在收盘后。",
+            },
+            action={"refresh_prices": True, "scope": "positions+watchlist"},
+            cadence="market_hours_4x_daily",
+            is_enabled=True,
+        )
+    )
+    session.flush()
 
 
 def default_account(session) -> m.PortfolioAccount:
@@ -161,6 +205,16 @@ def list_positions(session) -> list[m.Position]:
     )
 
 
+def positions_with_metrics(session) -> list[dict[str, Any]]:
+    positions = list_positions(session)
+    raw_metrics = [(p, position_metrics(session, p)) for p in positions]
+    total_market_value = sum(float(metrics["market_value"] or 0) for _, metrics in raw_metrics)
+    return [
+        {**p.__dict__, **position_metrics(session, p, total_market_value)}
+        for p, _ in raw_metrics
+    ]
+
+
 def get_position(session, position_id: str) -> m.Position | None:
     return session.execute(
         select(m.Position)
@@ -253,6 +307,7 @@ def create_research_report(session, payload) -> m.ResearchReport:
 
 
 def list_tracking_rules(session) -> list[m.TrackingRule]:
+    ensure_default_tracking_rules(session)
     return list(session.execute(select(m.TrackingRule).order_by(m.TrackingRule.created_at.desc())).scalars())
 
 
@@ -273,6 +328,54 @@ def update_tracking_rule(session, rule_id: str, payload) -> m.TrackingRule | Non
     return rule
 
 
+def delete_tracking_rule(session, rule_id: str) -> bool:
+    rule = session.get(m.TrackingRule, rule_id)
+    if not rule:
+        return False
+    session.delete(rule)
+    session.flush()
+    return True
+
+
+def list_rule_events(session, *, limit: int = 10, offset: int = 0) -> dict[str, Any]:
+    total = session.scalar(select(func.count(m.RuleTriggerEvent.id))) or 0
+    records = list(
+        session.execute(
+            select(m.RuleTriggerEvent)
+            .order_by(m.RuleTriggerEvent.triggered_at.desc())
+            .offset(max(0, offset))
+            .limit(max(1, min(limit, 100)))
+        ).scalars()
+    )
+    rule_ids = {record.rule_id for record in records}
+    rules = {}
+    if rule_ids:
+        rules = {
+            rule.id: rule
+            for rule in session.execute(select(m.TrackingRule).where(m.TrackingRule.id.in_(rule_ids))).scalars()
+        }
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": [
+            {
+                "id": record.id,
+                "rule_id": record.rule_id,
+                "rule_name": rules.get(record.rule_id).name if rules.get(record.rule_id) else None,
+                "rule_type": rules.get(record.rule_id).rule_type if rules.get(record.rule_id) else None,
+                "triggered_at": record.triggered_at,
+                "status": record.status,
+                "payload": record.payload,
+                "result": record.result,
+                "created_at": record.created_at,
+                "updated_at": record.updated_at,
+            }
+            for record in records
+        ],
+    }
+
+
 def list_decisions(session, instrument_id: str | None = None, limit: int = 30) -> list[m.DecisionLog]:
     stmt = select(m.DecisionLog).order_by(m.DecisionLog.decision_date.desc()).limit(limit)
     if instrument_id:
@@ -288,6 +391,7 @@ def create_decision(session, payload) -> m.DecisionLog:
 
 
 def dashboard(session) -> dict[str, Any]:
+    ensure_default_tracking_rules(session)
     positions = list_positions(session)
     total_cost = sum(float(p.cost_basis or 0) for p in positions)
     total_value = sum(position_metrics(session, p)["market_value"] or 0 for p in positions)

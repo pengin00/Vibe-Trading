@@ -129,9 +129,13 @@ class PositionOut(PositionCreate):
     instrument: InstrumentOut | None = Field(None, description="关联标的信息")
     account: PortfolioAccountOut | None = Field(None, description="关联账户信息")
     market_price: float | None = Field(None, description="最新估值价格")
+    market_price_as_of: datetime | None = Field(None, description="最新估值价格时间")
+    market_price_source: str | None = Field(None, description="最新估值价格来源")
     market_value: float = Field(0.0, description="最新市值")
     unrealized_pnl: float = Field(0.0, description="未实现盈亏")
     unrealized_pnl_pct: float = Field(0.0, description="未实现盈亏比例")
+    actual_weight: float | None = Field(None, description="实际仓位权重，0到1")
+    weight_drift: float | None = Field(None, description="实际权重减目标权重，0到1")
     created_at: datetime = Field(..., description="创建时间")
     updated_at: datetime = Field(..., description="最后更新时间")
 
@@ -216,6 +220,26 @@ class TrackingRuleOut(TrackingRuleCreate):
     updated_at: datetime = Field(..., description="最后更新时间")
 
 
+class RuleTriggerEventOut(PortfolioBaseModel):
+    id: str = Field(..., description="事件ID")
+    rule_id: str = Field(..., description="规则ID")
+    rule_name: str | None = Field(None, description="规则名称")
+    rule_type: str | None = Field(None, description="规则类型")
+    triggered_at: datetime = Field(..., description="触发时间")
+    status: str = Field(..., description="事件状态")
+    payload: dict[str, Any] = Field(default_factory=dict, description="触发上下文")
+    result: dict[str, Any] = Field(default_factory=dict, description="执行结果")
+    created_at: datetime = Field(..., description="创建时间")
+    updated_at: datetime = Field(..., description="最后更新时间")
+
+
+class RuleTriggerEventPage(PortfolioBaseModel):
+    total: int = Field(..., description="事件总数")
+    limit: int = Field(..., description="每页数量")
+    offset: int = Field(..., description="分页偏移")
+    items: list[RuleTriggerEventOut] = Field(default_factory=list, description="事件列表")
+
+
 class DecisionLogCreate(PortfolioBaseModel):
     instrument_id: str | None = Field(None, description="关联标的ID")
     decision_type: str = Field(..., description="决策类型：buy/sell/hold/watch/rebalance等")
@@ -243,6 +267,29 @@ class PortfolioDashboard(PortfolioBaseModel):
     total_market_value: float = Field(..., description="总市值")
     total_unrealized_pnl: float = Field(..., description="总未实现盈亏")
     recent_reports: list[ResearchReportOut] = Field(default_factory=list, description="最近研报")
+
+
+class PortfolioAutopilotRunRequest(PortfolioBaseModel):
+    max_targets: int = Field(10, ge=1, le=100, description="本次自动研究最多处理的标的数量")
+    create_reports: bool = Field(True, description="是否写入自动研究简报")
+    refresh_prices: bool = Field(True, description="是否尝试刷新价格；关闭时只使用已有价格快照")
+
+
+class PortfolioAutopilotScheduleRequest(PortfolioBaseModel):
+    interval_seconds: int = Field(3600, ge=60, description="自动研究执行间隔，秒")
+    max_targets: int = Field(10, ge=1, le=100, description="每次最多处理的标的数量")
+    run_immediately: bool = Field(False, description="启动后是否立即执行一次")
+
+
+class PortfolioAutopilotRunResponse(PortfolioBaseModel):
+    status: str = Field(..., description="执行状态")
+    started_at: datetime = Field(..., description="开始时间")
+    finished_at: datetime = Field(..., description="结束时间")
+    targets: list[dict[str, Any]] = Field(default_factory=list, description="本次处理的标的")
+    price_snapshots: list[str] = Field(default_factory=list, description="新增价格快照ID")
+    triggered_events: list[str] = Field(default_factory=list, description="触发事件ID")
+    research_reports: list[str] = Field(default_factory=list, description="新增研报ID")
+    errors: list[str] = Field(default_factory=list, description="错误列表")
 
 
 class PositionImportItemPatch(PortfolioBaseModel):

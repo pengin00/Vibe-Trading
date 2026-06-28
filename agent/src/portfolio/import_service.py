@@ -26,6 +26,14 @@ REQUIRED_FIELDS = ["symbol", "name", "quantity", "avg_cost", "market", "currency
 LOW_CONFIDENCE_THRESHOLD = 0.7
 
 
+def _first_present(raw: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = raw.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
 def _clean_number(value: Any) -> float | None:
     if value is None or value == "":
         return None
@@ -91,16 +99,16 @@ def _validate_item(data: dict[str, Any]) -> tuple[list[str], list[str], str]:
 
 
 def _normalize_item(raw: dict[str, Any], row_index: int) -> dict[str, Any]:
-    symbol = _norm_symbol(raw.get("symbol") or raw.get("code") or raw.get("ticker"))
-    market = _norm_market(symbol, raw.get("market") or raw.get("exchange"))
-    currency = _norm_currency(market, raw.get("currency"))
-    quantity = _clean_number(raw.get("quantity") or raw.get("shares") or raw.get("holding_quantity"))
-    avg_cost = _clean_number(raw.get("avg_cost") or raw.get("cost_price") or raw.get("cost") or raw.get("average_cost"))
-    cost_basis = _clean_number(raw.get("cost_basis") or raw.get("holding_cost") or raw.get("total_cost"))
-    market_price = _clean_number(raw.get("market_price") or raw.get("price") or raw.get("last_price"))
-    market_value = _clean_number(raw.get("market_value") or raw.get("value"))
-    pnl = _clean_number(raw.get("unrealized_pnl") or raw.get("pnl") or raw.get("profit_loss"))
-    pnl_pct = _clean_number(raw.get("unrealized_pnl_pct") or raw.get("pnl_pct") or raw.get("profit_loss_pct"))
+    symbol = _norm_symbol(_first_present(raw, "symbol", "code", "ticker"))
+    market = _norm_market(symbol, _first_present(raw, "market", "exchange"))
+    currency = _norm_currency(market, _first_present(raw, "currency"))
+    quantity = _clean_number(_first_present(raw, "quantity", "shares", "holding_quantity"))
+    avg_cost = _clean_number(_first_present(raw, "avg_cost", "cost_price", "cost", "average_cost"))
+    cost_basis = _clean_number(_first_present(raw, "cost_basis", "holding_cost", "total_cost"))
+    market_price = _clean_number(_first_present(raw, "market_price", "price", "last_price"))
+    market_value = _clean_number(_first_present(raw, "market_value", "value"))
+    pnl = _clean_number(_first_present(raw, "unrealized_pnl", "pnl", "profit_loss"))
+    pnl_pct = _clean_number(_first_present(raw, "unrealized_pnl_pct", "pnl_pct", "profit_loss_pct"))
     if pnl_pct is not None and abs(pnl_pct) > 1:
         pnl_pct = pnl_pct / 100
     if cost_basis is None and quantity is not None and avg_cost is not None:
@@ -111,12 +119,12 @@ def _normalize_item(raw: dict[str, Any], row_index: int) -> dict[str, Any]:
     data = {
         "row_index": row_index,
         "symbol": symbol,
-        "name": (str(raw.get("name") or raw.get("security_name") or "").strip() or symbol),
+        "name": (str(_first_present(raw, "name", "security_name") or "").strip() or symbol),
         "market": market,
-        "asset_class": str(raw.get("asset_class") or "equity").strip().lower(),
+        "asset_class": str(_first_present(raw, "asset_class") or "equity").strip().lower(),
         "currency": currency,
         "quantity": quantity,
-        "available_quantity": _clean_number(raw.get("available_quantity") or raw.get("available")),
+        "available_quantity": _clean_number(_first_present(raw, "available_quantity", "available")),
         "avg_cost": avg_cost,
         "cost_basis": cost_basis,
         "market_price": market_price,
@@ -325,11 +333,19 @@ def patch_import_job(session, job_id: str, payload: s.PositionImportJobPatch) ->
             if not item:
                 item = m.PositionImportItem(job_id=job.id, row_index=idx)
                 session.add(item)
-            for key, value in values.items():
-                setattr(item, key, value)
-            normalized = _normalize_item({**item.raw, **values}, idx)
+            merged_raw = {**(item.raw or {}), **values}
+            normalized = _normalize_item(merged_raw, idx)
             for key in ("symbol", "name", "market", "asset_class", "currency", "quantity", "available_quantity", "avg_cost", "cost_basis", "market_price", "market_value", "unrealized_pnl", "unrealized_pnl_pct", "missing_fields", "warnings", "status"):
                 setattr(item, key, normalized[key])
+            if "status" in values and values["status"] == "skipped":
+                item.status = "skipped"
+                item.missing_fields = []
+            item.source_text = values.get("source_text", normalized.get("source_text"))
+            item.raw = {**merged_raw, **{key: normalized[key] for key in (
+                "symbol", "name", "market", "asset_class", "currency", "quantity",
+                "available_quantity", "avg_cost", "cost_basis", "market_price",
+                "market_value", "unrealized_pnl", "unrealized_pnl_pct",
+            )}}
             item.confidence = max(item.confidence or 0, 1.0 if not item.missing_fields else 0.6)
     session.flush()
     _revalidate_job(session, job)
