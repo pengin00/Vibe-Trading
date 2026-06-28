@@ -916,6 +916,17 @@ async def require_settings_write_auth(
         )
 
 
+try:
+    from src.portfolio.api import router as portfolio_router
+
+    app.include_router(
+        portfolio_router,
+        dependencies=[Depends(require_local_or_auth)],
+    )
+except Exception as exc:
+    logger.warning("Portfolio API unavailable: %s", exc)
+
+
 # ============================================================================
 # Workflow Factory
 # ============================================================================
@@ -3400,7 +3411,10 @@ def serve_main(argv: list[str] | None = None) -> int:
         print("[dev] Frontend: http://localhost:5173")
         print(f"[dev] API: http://localhost:{args.port}")
     elif frontend_dist.exists():
-        if not any(route.path == "/" for route in app.routes):
+        # Only check routes that actually expose a top-level path. Some entries
+        # in `app.routes` are `_IncludedRouter` (sub-routers) and do not have a
+        # `path` attribute, which would raise AttributeError on access.
+        if not any(getattr(route, "path", None) == "/" for route in app.routes):
             app.mount("/", SPAStaticFiles(directory=str(frontend_dist), html=True), name="frontend")
         print(f"[prod] Frontend served from {frontend_dist}")
     else:

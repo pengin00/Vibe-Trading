@@ -43,8 +43,16 @@ RUN pip install --no-cache-dir -e .
 
 # Runtime should not run as root. Keep writable app data directories owned by
 # the service user so named Docker volumes inherit usable permissions.
+# Note: agent/{runs,sessions,uploads,.swarm/runs} may be host-side symlinks
+# (e.g. set up by the dev installer to point at /Users/.../vibe-data). COPY
+# dereferences them, but with --no-cache or fresh clones the resolved path
+# can end up as a regular file, which would break `mkdir -p`. Use `install -d`
+# + a tolerant loop so we always end with real directories owned by `vibe`.
 RUN useradd --create-home --shell /usr/sbin/nologin vibe \
-    && mkdir -p agent/runs agent/sessions agent/uploads agent/.swarm/runs /home/vibe/.vibe-trading \
+    && for d in agent/runs agent/sessions agent/uploads agent/.swarm/runs /home/vibe/.vibe-trading; do \
+         if [ -e "$d" ] && [ ! -d "$d" ]; then rm -f "$d"; fi; \
+         install -d -o vibe -g vibe "$d"; \
+       done \
     && chown -R vibe:vibe /app /home/vibe/.vibe-trading
 USER vibe
 

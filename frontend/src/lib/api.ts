@@ -75,10 +75,167 @@ export interface SessionTraceResponse {
   entries: SessionTraceEntry[];
 }
 
+export interface PortfolioDashboard {
+  accounts: number;
+  instruments: number;
+  watchlist_items: number;
+  positions: number;
+  total_cost_basis: number;
+  total_market_value: number;
+  total_unrealized_pnl: number;
+  recent_reports: PortfolioResearchReport[];
+}
+
+export interface PortfolioInstrument {
+  id: string;
+  symbol: string;
+  name: string;
+  market: string;
+  asset_class: string;
+  currency: string;
+  sector?: string | null;
+  region?: string | null;
+  tags: string[];
+  thesis?: string | null;
+  data_source?: string | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PortfolioWatchlistItem {
+  id: string;
+  instrument_id: string;
+  priority: number;
+  status: string;
+  target_price?: number | null;
+  alert_price_low?: number | null;
+  alert_price_high?: number | null;
+  notes?: string | null;
+  instrument?: PortfolioInstrument | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PortfolioPosition {
+  id: string;
+  account_id: string;
+  instrument_id: string;
+  instrument?: PortfolioInstrument | null;
+  quantity: number;
+  avg_cost: number;
+  cost_basis: number;
+  target_weight?: number | null;
+  stop_loss?: number | null;
+  take_profit?: number | null;
+  notes?: string | null;
+  market_price?: number | null;
+  market_value: number;
+  unrealized_pnl: number;
+  unrealized_pnl_pct: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PortfolioResearchReport {
+  id: string;
+  instrument_id?: string | null;
+  title: string;
+  report_type: string;
+  summary?: string | null;
+  content_path?: string | null;
+  content?: string | null;
+  rating?: string | null;
+  confidence?: number | null;
+  evidence: Record<string, unknown>[];
+  generated_by?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PortfolioDecision {
+  id: string;
+  instrument_id?: string | null;
+  decision_type: string;
+  title: string;
+  rationale: string;
+  expected_outcome?: string | null;
+  review_date?: string | null;
+  linked_report_id?: string | null;
+  decision_date: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PositionImportItem {
+  id: string;
+  job_id: string;
+  row_index: number;
+  symbol?: string | null;
+  name?: string | null;
+  market?: string | null;
+  asset_class?: string | null;
+  currency?: string | null;
+  quantity?: number | null;
+  available_quantity?: number | null;
+  avg_cost?: number | null;
+  cost_basis?: number | null;
+  market_price?: number | null;
+  market_value?: number | null;
+  unrealized_pnl?: number | null;
+  unrealized_pnl_pct?: number | null;
+  confidence: number;
+  field_confidence: Record<string, unknown>;
+  source_text?: string | null;
+  missing_fields: string[];
+  warnings: string[];
+  status: string;
+  saved_position_id?: string | null;
+  raw: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PositionImportJob {
+  id: string;
+  filename: string;
+  file_path: string;
+  content_type?: string | null;
+  broker?: string | null;
+  account_name?: string | null;
+  status: string;
+  parser: string;
+  summary?: string | null;
+  raw_result: Record<string, unknown>;
+  missing_fields: string[];
+  warnings: string[];
+  saved_at?: string | null;
+  items: PositionImportItem[];
+  created_at: string;
+  updated_at: string;
+}
+
+export type PositionImportItemPatch = Partial<Pick<PositionImportItem,
+  "symbol" | "name" | "market" | "asset_class" | "currency" | "quantity" | "available_quantity" |
+  "avg_cost" | "cost_basis" | "market_price" | "market_value" | "unrealized_pnl" | "unrealized_pnl_pct" |
+  "status" | "source_text"
+>>;
+
 async function uploadFile(file: File): Promise<UploadResult> {
   const form = new FormData();
   form.append("file", file);
   const res = await fetch(`${BASE}/upload`, { method: "POST", headers: authHeaders(), body: form });
+  if (!res.ok) {
+    throw await errorFromResponse(res);
+  }
+  return res.json();
+}
+
+async function uploadPositionScreenshot(file: File): Promise<PositionImportJob> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`${BASE}/portfolio/imports/screenshot`, { method: "POST", headers: authHeaders(), body: form });
   if (!res.ok) {
     throw await errorFromResponse(res);
   }
@@ -163,6 +320,29 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(settings),
     }),
+  portfolio: {
+    health: () => request<{ status: string; database: string }>("/portfolio/health"),
+    dashboard: () => request<PortfolioDashboard>("/portfolio/dashboard"),
+    listInstruments: () => request<PortfolioInstrument[]>("/portfolio/instruments?active=true"),
+    createInstrument: (body: Partial<PortfolioInstrument> & { symbol: string; name: string }) =>
+      request<PortfolioInstrument>("/portfolio/instruments", { method: "POST", body: JSON.stringify(body) }),
+    listWatchlist: () => request<PortfolioWatchlistItem[]>("/portfolio/watchlist"),
+    createWatchlistItem: (body: { instrument_id: string; priority?: number; status?: string; notes?: string }) =>
+      request<PortfolioWatchlistItem>("/portfolio/watchlist", { method: "POST", body: JSON.stringify(body) }),
+    listPositions: () => request<PortfolioPosition[]>("/portfolio/positions"),
+    createPosition: (body: { instrument_id: string; quantity: number; avg_cost: number; target_weight?: number | null; notes?: string }) =>
+      request<PortfolioPosition>("/portfolio/positions", { method: "POST", body: JSON.stringify(body) }),
+    listResearchReports: () => request<PortfolioResearchReport[]>("/portfolio/research-reports?limit=10"),
+    listDecisions: () => request<PortfolioDecision[]>("/portfolio/decisions?limit=10"),
+    createDecision: (body: { instrument_id?: string | null; decision_type: string; title: string; rationale: string; expected_outcome?: string }) =>
+      request<PortfolioDecision>("/portfolio/decisions", { method: "POST", body: JSON.stringify(body) }),
+    listImports: () => request<PositionImportJob[]>("/portfolio/imports?limit=10"),
+    uploadPositionScreenshot,
+    updateImport: (jobId: string, body: { broker?: string | null; account_name?: string | null; summary?: string | null; items?: PositionImportItemPatch[] }) =>
+      request<PositionImportJob>(`/portfolio/imports/${jobId}`, { method: "PATCH", body: JSON.stringify(body) }),
+    confirmImport: (jobId: string, body: { account_name?: string | null; broker?: string | null; overwrite_existing?: boolean; save_price_snapshots?: boolean }) =>
+      request<{ status: string; job_id: string; saved_positions: string[]; skipped_items: string[] }>(`/portfolio/imports/${jobId}/confirm`, { method: "POST", body: JSON.stringify(body) }),
+  },
 
   // Alpha Zoo API
   listAlphas: (params: AlphaListParams = {}) => {

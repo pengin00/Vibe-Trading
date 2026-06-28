@@ -56,6 +56,9 @@ dependencies = [
     "matplotlib>=3.7.0",
     "weasyprint>=60.0",
     "prompt_toolkit>=3.0.0",
+    "SQLAlchemy>=2.0.0",
+    "psycopg[binary]>=3.1.0",
+    "alembic>=1.13.0",
 ]
 
 [project.urls]

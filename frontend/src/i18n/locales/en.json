@@ -5,6 +5,7 @@
   "layout": {
     "home": "Home",
     "agent": "Agent",
+    "portfolio": "Portfolio",
     "runtime": "Runtime",
     "alphaZoo": "Alpha Zoo",
     "settings": "Settings",
